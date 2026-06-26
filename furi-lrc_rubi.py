@@ -50,9 +50,16 @@ try:
 except ImportError:
     pass
 
+def _app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+APP_DIR = _app_dir()
+
 # ── Config ───
-FONTS_DIR   = Path(__file__).parent / "fonts"
-CONFIG_PATH = Path(__file__).parent / "settings.json"
+FONTS_DIR   = APP_DIR / "fonts"
+CONFIG_PATH = APP_DIR / "settings.json"
 DEFAULT_CFG = dict(
     x=50, y=50, w=580, h=320,
     opacity=0.88, locked=False,
@@ -72,8 +79,8 @@ def load_config() -> dict:
             cfg = {**DEFAULT_CFG, **json.loads(CONFIG_PATH.read_text("utf-8"))}
             for key in ("font_jp", "font_zh"):
                 val = cfg[key]
-                p = Path(val) if Path(val).is_absolute() else Path(__file__).parent / val
-                if p.suffix.lower() not in {".ttf", ".otf", ".ttc", ".woff", ".woff2"}:
+                p = Path(val) if Path(val).is_absolute() else APP_DIR / val
+                if p.suffix.lower() not in {".ttf", ".otf", ".ttc", ".woff", ".woff2"} or not p.exists():
                     cfg[key] = DEFAULT_CFG[key]
             return cfg
         except Exception:
@@ -217,7 +224,7 @@ def _load_qt_font(path_str: str, size: int,
     if path_str:
         p = Path(path_str)
         if not p.is_absolute():
-            p = Path(__file__).parent / p
+            p = APP_DIR / p
         fid      = QFontDatabase.addApplicationFont(str(p))
         families = QFontDatabase.applicationFontFamilies(fid)
         if families:

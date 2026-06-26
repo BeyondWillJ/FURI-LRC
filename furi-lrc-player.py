@@ -50,9 +50,16 @@ try:
 except ImportError:
     HAS_MUTAGEN = False
 
+def _app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+APP_DIR = _app_dir()
+
 # ── Load overlay module (furi-lrc_rubi.py) ──────────────────────────────────
 def _load_overlay():
-    p = Path(__file__).parent / "furi-lrc_rubi.py"
+    p = APP_DIR / "furi-lrc_rubi.py"
     if not p.exists():
         return None
     spec = importlib.util.spec_from_file_location("_furi_lrc_rubi", p)
@@ -1558,17 +1565,17 @@ class PlayerWindow(QMainWindow):
         else:
             self._now_playing.update_track(None)
         # track the path for Ctrl+S quick-save (skip for _last_playlist auto-save)
-        last = str(Path(__file__).parent / "_last_playlist.flpl")
+        last = str(APP_DIR / "_last_playlist.flpl")
         if path != last:
             self._current_playlist_path = path
 
     def _load_last_playlist(self):
-        last = Path(__file__).parent / "_last_playlist.flpl"
+        last = APP_DIR / "_last_playlist.flpl"
         if last.exists():
             self._load_playlist(str(last))
 
     def _save_last_playlist(self):
-        last = Path(__file__).parent / "_last_playlist.flpl"
+        last = APP_DIR / "_last_playlist.flpl"
         self._save_playlist(str(last))
 
     # ── Overlay toggle ────────────────────────────────────────────────────────
@@ -1636,7 +1643,7 @@ def main():
     app.setApplicationName("furi-lrc-player")
 
     # Load bundled Noto Sans JP and apply as app-wide UI font
-    _font_path = Path(__file__).parent / "fonts" / "NotoSansJP-Regular.ttf"
+    _font_path = APP_DIR / "fonts" / "NotoSansJP-Regular.ttf"
     if _font_path.exists():
         _fid = QFontDatabase.addApplicationFont(str(_font_path))
         if _fid >= 0:

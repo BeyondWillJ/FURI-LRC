@@ -1,10 +1,14 @@
 {
   "tracks": [
     {
-      "path": "E:/日语/日语/main/Homework/FURI-LRC/夜に駆ける.mp3",
-      "lyrics": ""
+      "path": "M:/HOMEWORK/FURI-LRC/夜に駆ける.mp3",
+      "lyrics": "M:/HOMEWORK/FURI-LRC/yoru-ni-kakeru.json"
     }
   ],
   "current": 0,
-  "loop_mode": 1
+  "loop_mode": 1,
+  "position_ms": 7132,
+  "volume": 0.47297297297297297,
+  "playing": false,
+  "shuffle_history": []
 }
