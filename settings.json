@@ -1,19 +1,20 @@
 {
-  "x": 1264,
-  "y": 871,
-  "w": 669,
-  "h": 155,
+  "x": 528,
+  "y": 293,
+  "w": 418,
+  "h": 97,
   "opacity": 0.95,
   "locked": false,
   "font_jp": "M:/HOMEWORK/FURI-LRC/fonts/NotoSerifJP-SemiBold.ttf",
   "font_zh": "M:/HOMEWORK/FURI-LRC/fonts/msyhbd.ttc",
   "font_size_jp": 40,
   "font_size_zh": 30,
-  "spacing_zh": -45,
+  "spacing_zh": -35,
   "color_sung": "#009c49",
   "color_unsung": "#888888",
   "color_zh": "#aaaaaa",
-  "lyrics_path": "M:\\HOMEWORK\\FURI-LRC\\sample-yoru-ni-kakeru.json",
+  "lyrics_path": "M:\\HOMEWORK\\FURI-LRC\\yoru-ni-kakeru.json",
   "hide_on_pause": true,
-  "unlock_zone": 70
+  "unlock_zone": 70,
+  "text_shadow": "2px 2px 8px rgba(0,0,0,0.85)"
 }

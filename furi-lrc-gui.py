@@ -39,7 +39,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QSlider, QFrame, QSizePolicy,
-    QScrollArea, QTextEdit, QGroupBox,
+    QScrollArea, QTextEdit, QGroupBox, QMenu, QComboBox,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, pyqtSignal, QUrl, QSize, QPoint,
@@ -87,6 +87,9 @@ def str_to_ms(text: str) -> Optional[int]:
 
 
 _RUBY_RE = re.compile(r'\{([^|{}]+)\|([^{}]+)\}')
+
+# Populated in main() after QFontDatabase.addApplicationFont
+_NOTO_JP = ""  # NotoSansJP family name
 
 
 def parse_jp_markup(text: str, t_start: int = 0, t_end: int = 5000) -> list:
@@ -148,7 +151,101 @@ def segments_to_markup(segs: list) -> str:
     return ''.join(parts)
 
 
+def merge_jp_timing(old_segs: list, new_segs: list,
+                    t_start: int, t_end: int) -> list:
+    """
+    Preserve per-character timing when the JP markup is edited.
+
+    Algorithm
+    ---------
+    1. Flatten both old and new segment lists into character sequences.
+    2. Run LCS (Longest Common Subsequence) on the character strings to find
+       which characters in the new text correspond to unchanged characters in
+       the old text.
+    3. Matched characters inherit the old (s, e) timestamps verbatim.
+    4. Unmatched (new / replaced) characters are assigned timestamps by
+       linearly interpolating between the surrounding matched anchors.
+       Sentinel anchors at t_start and t_end cover the edges.
+    """
+    # Flatten old timing
+    old_flat: list = []
+    for seg in old_segs:
+        for unit in seg.get('units', []):
+            old_flat.append((unit['k'], unit['s'], unit['e']))
+
+    new_segs = copy.deepcopy(new_segs)
+    new_flat: list = []          # [(seg_idx, unit_idx, char)]
+    for si, seg in enumerate(new_segs):
+        for ui, unit in enumerate(seg.get('units', [])):
+            new_flat.append((si, ui, unit['k']))
+
+    no, nn = len(old_flat), len(new_flat)
+    if no == 0 or nn == 0:
+        return new_segs
+
+    # ── LCS DP ──
+    dp = [[0] * (nn + 1) for _ in range(no + 1)]
+    for i in range(1, no + 1):
+        oc = old_flat[i - 1][0]
+        for j in range(1, nn + 1):
+            if oc == new_flat[j - 1][2]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+
+    # Backtrack → matched (new_j, old_i) pairs (0-indexed)
+    matches: list = []
+    i, j = no, nn
+    while i > 0 and j > 0:
+        if old_flat[i - 1][0] == new_flat[j - 1][2]:
+            matches.append((j - 1, i - 1))
+            i -= 1
+            j -= 1
+        elif dp[i - 1][j] >= dp[i][j - 1]:
+            i -= 1
+        else:
+            j -= 1
+    matches.reverse()
+
+    # timing[j] = (s, e) for matched new positions, None for unmatched
+    timing: list = [None] * nn
+    for nj, oi in matches:
+        timing[nj] = (old_flat[oi][1], old_flat[oi][2])
+
+    # ── Interpolate unmatched positions ──
+    # Build anchor list with sentinels at both ends
+    anchors: list = [(-1, t_start, t_start)]
+    for nj in range(nn):
+        if timing[nj] is not None:
+            anchors.append((nj, timing[nj][0], timing[nj][1]))
+    anchors.append((nn, t_end, t_end))
+
+    for ai in range(len(anchors) - 1):
+        lj, _ls, le = anchors[ai]      # left anchor: position, s, e
+        rj, rs, _re = anchors[ai + 1]  # right anchor
+        gap = list(range(lj + 1, rj))  # unmatched indices between the two anchors
+        if not gap:
+            continue
+        dur = max(1, rs - le)
+        udur = dur / len(gap)
+        for k, gj in enumerate(gap):
+            timing[gj] = (int(le + k * udur), int(le + (k + 1) * udur))
+
+    # Write timing back into new_segs
+    for nj, (si, ui, _) in enumerate(new_flat):
+        if timing[nj] is not None:
+            new_segs[si]['units'][ui]['s'] = timing[nj][0]
+            new_segs[si]['units'][ui]['e'] = timing[nj][1]
+
+    return new_segs
+
+
 def line_end_ms(lines: list, idx: int) -> int:
+    # Prefer explicitly stored end time
+    if 0 <= idx < len(lines):
+        explicit = lines[idx].get('end')
+        if explicit is not None:
+            return explicit
     if idx + 1 < len(lines):
         return lines[idx + 1]['start']
     return lines[idx]['start'] + 5000 if lines else 5000
@@ -256,7 +353,8 @@ class WaveformWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setToolTip("左クリック: シーク  マーカードラッグ: 時間調整  スクロール: ズーム  Ctrl+スクロール: 左右移動")
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
+        self.setToolTip("左クリック: シーク  右ドラッグ: 歌詞マーカー移動  スクロール: 左右移動  Ctrl+スクロール: ズーム")
 
     # ─── public setters ───
 
@@ -389,16 +487,18 @@ class WaveformWidget(QWidget):
         pts = chunk[idx]
         mid = h // 2
         scale = float(mid - 4)
+        x_scale = (w - 1) / max(1, n_pts - 1)  # map sample index → pixel x
 
         path = QPainterPath()
         for i, v_val in enumerate(pts):
             amp = float(v_val) * scale
+            x = i * x_scale
             if i == 0:
-                path.moveTo(i, mid - amp)
+                path.moveTo(x, mid - amp)
             else:
-                path.lineTo(i, mid - amp)
+                path.lineTo(x, mid - amp)
         for i in range(n_pts - 1, -1, -1):
-            path.lineTo(i, mid + float(pts[i]) * scale)
+            path.lineTo(i * x_scale, mid + float(pts[i]) * scale)
         path.closeSubpath()
 
         grad = QLinearGradient(0, 0, 0, h)
@@ -409,7 +509,7 @@ class WaveformWidget(QWidget):
 
         top = QPainterPath()
         for i, v_val in enumerate(pts):
-            x, y = i, mid - float(v_val) * scale
+            x, y = i * x_scale, mid - float(v_val) * scale
             if i == 0:
                 top.moveTo(x, y)
             else:
@@ -445,18 +545,17 @@ class WaveformWidget(QWidget):
             t += tick_ms
 
     def mousePressEvent(self, e):
+        px = e.position().x()
         if e.button() == Qt.MouseButton.LeftButton:
-            px = e.position().x()
-            # Check if click is near a lyric line marker (±6 px) → start drag
+            ms = max(0, min(self._duration_ms, self._x_to_ms(px)))
+            self.seek_requested.emit(ms)
+        elif e.button() == Qt.MouseButton.RightButton:
             for i, line in enumerate(self._lines):
                 x = int(self._ms_to_x(line['start']))
                 if abs(int(px) - x) <= 6:
                     self._drag_line_idx = i
                     self.drag_start.emit(i)
-                    return
-            # Normal seek
-            ms = max(0, min(self._duration_ms, self._x_to_ms(px)))
-            self.seek_requested.emit(ms)
+                    break
 
     def mouseMoveEvent(self, e):
         px = e.position().x()
@@ -470,18 +569,18 @@ class WaveformWidget(QWidget):
                 self._hover_marker_idx = i
                 break
 
-        if self._drag_line_idx >= 0 and (e.buttons() & Qt.MouseButton.LeftButton):
-            # Drag marker: update time and change cursor
+        if self._drag_line_idx >= 0 and (e.buttons() & Qt.MouseButton.RightButton):
             ms = max(0, min(self._duration_ms, self._x_to_ms(px)))
             self.line_time_changed.emit(self._drag_line_idx, ms)
             self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif e.buttons() & Qt.MouseButton.LeftButton:
+            ms = max(0, min(self._duration_ms, self._hover_ms))
+            self.seek_requested.emit(ms)
+            self.setCursor(Qt.CursorShape.CrossCursor)
         elif self._hover_marker_idx >= 0:
             self.setCursor(Qt.CursorShape.SizeHorCursor)
         else:
             self.setCursor(Qt.CursorShape.CrossCursor)
-            if e.buttons() & Qt.MouseButton.LeftButton:
-                ms = max(0, min(self._duration_ms, self._hover_ms))
-                self.seek_requested.emit(ms)
         self.update()
 
     def leaveEvent(self, _):
@@ -490,7 +589,7 @@ class WaveformWidget(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and self._drag_line_idx >= 0:
+        if e.button() == Qt.MouseButton.RightButton and self._drag_line_idx >= 0:
             self._drag_line_idx = -1
             self.drag_end.emit()
             self.update()
@@ -498,15 +597,15 @@ class WaveformWidget(QWidget):
     def wheelEvent(self, e):
         delta = e.angleDelta().y()
         if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            shift = self._vis_ms() * 0.15 * (-1 if delta > 0 else 1)
-            self._scroll_ms = max(0.0, self._scroll_ms + shift)
-        else:
             factor = 1.3 if delta > 0 else 1 / 1.3
             cursor_ms = float(self._x_to_ms(e.position().x()))
             self._zoom = max(1.0, min(300.0, self._zoom * factor))
             v = self._vis_ms()
             offset = e.position().x() / (self.width() or 1) * v
             self._scroll_ms = max(0.0, cursor_ms - offset)
+        else:
+            shift = self._vis_ms() * 0.15 * (-1 if delta > 0 else 1)
+            self._scroll_ms = max(0.0, self._scroll_ms + shift)
         self.update()
 
 
@@ -547,27 +646,37 @@ class TimeEdit(QLineEdit):
 
 class UnitTapDialog(QDialog):
     """
-    Tap each unit's start time while listening to the line's audio.
-    Returns updated segment list via .result_segs.
+    Re-time units by tapping Space in sync with slowed-down playback.
+
+    Flow
+    ----
+    Space ①  → start playback from line_start at selected speed
+    Space ②…N+1 → stamp start of unit[0..N-1]
+                   (each tap also closes the previous unit)
+    Space N+2    → stamp end of unit[N-1] → playback pauses, done
+    OK / Cancel  → confirm / discard
     """
+    _SPEEDS = [0.25, 0.5, 0.75, 1.0]
+    _SPEED_LABELS = ["0.25×", "0.5×", "0.75×", "1.0×"]
+
     def __init__(self, segs: list, line_start: int, line_end: int,
                  player, parent=None):
         super().__init__(parent)
         self.setWindowTitle("ユニット打拍")
         self.setModal(True)
-        self.resize(580, 340)
+        self.resize(640, 360)
         self._segs = copy.deepcopy(segs)
         self._player = player
         self._line_start = line_start
         self._line_end = line_end
-        self._flat: list = []   # flat list of unit dicts + (seg_i, unit_i)
-        self._tap_idx = 0
-        self._waiting_end = False   # waiting for end-time tap of last char
+        self._flat: list = []
+        self._tap_idx = 0        # index of next unit to receive a start-time stamp
+        self._phase = 'ready'    # 'ready' | 'tapping' | 'done'
+        self._orig_rate = 1.0    # saved playback rate; restored on close
         self.result_segs: Optional[list] = None
 
         self._flatten()
         self._build_ui()
-        self._highlight(0)
 
     def _flatten(self):
         for si, seg in enumerate(self._segs):
@@ -577,109 +686,163 @@ class UnitTapDialog(QDialog):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
+        layout.setSpacing(8)
 
-        # Instructions
+        # ── Speed selector ──
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(QLabel("再生速度 (打拍用):"))
+        self._speed_combo = QComboBox()
+        for lbl in self._SPEED_LABELS:
+            self._speed_combo.addItem(lbl)
+        self._speed_combo.setCurrentIndex(0)   # default 0.25×
+        self._speed_combo.setFixedWidth(90)
+        speed_row.addWidget(self._speed_combo)
+        speed_row.addStretch()
+        layout.addLayout(speed_row)
+
+        # ── Instruction ──
         instr = QLabel(
-            "【使い方】再生ボタンを押してから、各文字が読まれるタイミングで"
-            "  <b>Space</b>  を押してください。\n"
-            "完了後 OK を押すと時間が確定されます。"
+            "Space ①: 再生開始  →  "
+            "Space ②〜: 各文字の開始タイミングを打拍  →  "
+            "最後の Space: 最後の文字の終了時間を確定"
         )
         instr.setWordWrap(True)
         layout.addWidget(instr)
 
-        # Unit display grid
+        # ── Unit buttons ──
         self._unit_frame = QWidget()
         flow = QHBoxLayout(self._unit_frame)
         flow.setSpacing(4)
+        flow.setContentsMargins(0, 0, 0, 0)
         self._unit_btns: list = []
         for info in self._flat:
             btn = QPushButton(info['k'])
             btn.setFixedSize(46, 46)
-            btn.setFont(QFont("", 16))
+            btn.setFont(QFont(_NOTO_JP or "", 16))
             btn.setEnabled(False)
             flow.addWidget(btn)
             self._unit_btns.append(btn)
         flow.addStretch()
         layout.addWidget(self._unit_frame)
 
-        # Tap button (large, prominent)
-        tap_row = QHBoxLayout()
-        self._tap_btn = QPushButton("⏱ 打拍 (Space)")
-        self._tap_btn.setFixedHeight(48)
+        # ── Tap button ──
+        self._tap_btn = QPushButton("▶  再生開始  (Space)")
+        self._tap_btn.setFixedHeight(52)
         self._tap_btn.setFont(QFont("", 14))
         self._tap_btn.setStyleSheet(
-            "QPushButton{background:#2e6fa0;color:white;border-radius:6px;}"
-            "QPushButton:hover{background:#3a88c0;}"
+            "QPushButton{background:#2e8b4a;color:white;border-radius:6px;}"
+            "QPushButton:hover{background:#39a85c;}"
         )
         self._tap_btn.clicked.connect(self._tap)
-        tap_row.addWidget(self._tap_btn)
-        layout.addLayout(tap_row)
+        layout.addWidget(self._tap_btn)
 
-        # Status
-        self._status = QLabel("→ まず再生してから打拍してください")
+        # ── Status ──
+        self._status = QLabel("→ Space を押して再生を開始してください")
         layout.addWidget(self._status)
 
-        # OK / Cancel
+        # ── OK / Cancel ──
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         bb.accepted.connect(self._accept)
-        bb.rejected.connect(self.reject)
+        bb.rejected.connect(self._on_cancel)
         layout.addWidget(bb)
 
-        # Space shortcut
+        # Space shortcut (scoped to this dialog only)
         sc = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         sc.activated.connect(self._tap)
 
-    def _tap(self):
-        now = self._player.position() if (self._player and HAS_MULTIMEDIA) else self._line_start
+    def _get_speed(self) -> float:
+        return self._SPEEDS[self._speed_combo.currentIndex()]
 
-        # Second phase: waiting for end-time of the last character
-        if self._waiting_end:
-            self._flat[-1]['e'] = now
-            self._waiting_end = False
-            self._tap_btn.setText("⏱ 打拍 (Space)")
-            for btn in self._unit_btns:
-                btn.setStyleSheet("background:#c8e8d5;color:#1a6035;")
-            self._status.setText("✔ 打拍完了。OK を押して確定してください。")
-            return
+    def _restore_player(self):
+        if self._player and HAS_MULTIMEDIA:
+            if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self._player.pause()
+            self._player.setPlaybackRate(self._orig_rate)
 
-        if self._tap_idx >= len(self._flat):
-            return
-        info = self._flat[self._tap_idx]
-        info['s'] = now
-        # Set previous unit's end = current unit's start
-        if self._tap_idx > 0:
-            self._flat[self._tap_idx - 1]['e'] = now
-        self._tap_idx += 1
-        if self._tap_idx < len(self._flat):
-            self._highlight(self._tap_idx)
-            self._status.setText(
-                f"→ 次: 「{self._flat[self._tap_idx]['k']}」  ({self._tap_idx + 1}/{len(self._flat)})"
-            )
-        else:
-            # All characters tapped — now ask for end-time of the last one
-            self._waiting_end = True
-            for btn in self._unit_btns:
-                btn.setStyleSheet("background:#ffe066;color:#6b4800;")
-            self._tap_btn.setText("⏱ 終了時間 (Space)")
-            self._status.setText(
-                f"→ 最後の文字「{self._flat[-1]['k']}」の終了時間を打拍"
-                "（省略する場合はそのまま OK）"
-            )
-
-    def _highlight(self, idx: int):
+    def _highlight(self, active_idx: int):
         for i, btn in enumerate(self._unit_btns):
-            if i < idx:
+            if i < active_idx:
                 btn.setStyleSheet("background:#c8e8d5;color:#1a6035;")
-            elif i == idx:
+            elif i == active_idx:
                 btn.setStyleSheet("background:#e6a800;color:white;font-weight:bold;")
             else:
                 btn.setStyleSheet("")
 
+    # ── tap state machine ──
+
+    def _tap(self):
+        # ─── Phase: ready → start playback ───
+        if self._phase == 'ready':
+            if self._player and HAS_MULTIMEDIA:
+                self._orig_rate = self._player.playbackRate()
+                self._player.setPlaybackRate(self._get_speed())
+                self._player.setPosition(self._line_start)
+                self._player.play()
+            self._phase = 'tapping'
+            self._speed_combo.setEnabled(False)
+            if not self._flat:
+                self._phase = 'done'
+                self._tap_btn.setEnabled(False)
+                self._status.setText("（ユニットがありません）")
+                return
+            self._highlight(0)
+            self._tap_btn.setText(f"⏱  第 1 拍  (Space)")
+            self._tap_btn.setStyleSheet(
+                "QPushButton{background:#2e6fa0;color:white;border-radius:6px;}"
+                "QPushButton:hover{background:#3a88c0;}"
+            )
+            self._status.setText(
+                f"→ 「{self._flat[0]['k']}」の開始時間を打拍  (1 / {len(self._flat)})"
+            )
+            return
+
+        # ─── Phase: tapping ───
+        if self._phase != 'tapping':
+            return
+        now = self._player.position() if (self._player and HAS_MULTIMEDIA) else self._line_start
+
+        if self._tap_idx < len(self._flat):
+            # Stamp start of current unit; close previous
+            self._flat[self._tap_idx]['s'] = now
+            if self._tap_idx > 0:
+                self._flat[self._tap_idx - 1]['e'] = now
+            self._tap_idx += 1
+
+            if self._tap_idx < len(self._flat):
+                self._highlight(self._tap_idx)
+                self._tap_btn.setText(f"⏱  第 {self._tap_idx + 1} 拍  (Space)")
+                self._status.setText(
+                    f"→ 「{self._flat[self._tap_idx]['k']}」の開始時間を打拍"
+                    f"  ({self._tap_idx + 1} / {len(self._flat)})"
+                )
+            else:
+                # All starts recorded — waiting for end of last unit
+                for btn in self._unit_btns:
+                    btn.setStyleSheet("background:#ffe066;color:#6b4800;")
+                self._tap_btn.setText("⏱  終了時間  (Space)")
+                self._status.setText(
+                    f"→ 最後の文字「{self._flat[-1]['k']}」の終了時間を打拍"
+                    "  (省略可: そのまま OK)"
+                )
+        else:
+            # Stamp end of last unit → session complete
+            self._flat[-1]['e'] = now
+            self._phase = 'done'
+            self._restore_player()
+            for btn in self._unit_btns:
+                btn.setStyleSheet("background:#c8e8d5;color:#1a6035;")
+            self._tap_btn.setText("✔  完了")
+            self._tap_btn.setEnabled(False)
+            self._status.setText("✔ 打拍完了。OK を押して確定してください。")
+
+    # ── accept / cancel ──
+
     def _accept(self):
-        # If user skipped end-time tap, fall back to line_end
-        if self._waiting_end and self._flat:
+        self._restore_player()
+        # Fallback: last unit end if user skipped the final tap
+        if self._flat and self._phase == 'tapping' and self._tap_idx >= len(self._flat):
             self._flat[-1]['e'] = self._line_end
         # Write timing back to segs
         for info in self._flat:
@@ -687,6 +850,10 @@ class UnitTapDialog(QDialog):
             self._segs[info['si']]['units'][info['ui']]['e'] = info['e']
         self.result_segs = self._segs
         self.accept()
+
+    def _on_cancel(self):
+        self._restore_player()
+        self.reject()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -702,6 +869,7 @@ class LineEditor(QWidget):
         self._line_idx = -1
         self._all_lines: list = []
         self._player = None
+        self._playing_row = -1   # row index currently highlighted by playhead
         self._build_ui()
 
     def _build_ui(self):
@@ -721,15 +889,28 @@ class LineEditor(QWidget):
 
         # Time row
         time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("開始時間:"))
+        time_row.addWidget(QLabel("開始:"))
         self._time_edit = TimeEdit()
         self._time_edit.time_changed.connect(self._on_time_changed)
         time_row.addWidget(self._time_edit)
-        self._set_now_btn = QPushButton("⏱ 今の時間")
-        self._set_now_btn.setToolTip("再生中の時間を開始時間に設定 (Shortcut: T)")
+        self._set_now_btn = QPushButton("⏱")
+        self._set_now_btn.setToolTip("再生中の時間を開始時間に設定 (T)")
         self._set_now_btn.clicked.connect(self._set_to_now)
-        self._set_now_btn.setFixedWidth(100)
+        self._set_now_btn.setFixedWidth(32)
         time_row.addWidget(self._set_now_btn)
+        time_row.addSpacing(10)
+        time_row.addWidget(QLabel("終了:"))
+        self._end_edit = TimeEdit()
+        self._end_edit.setToolTip(
+            "字幕の終了時間。未設定の場合は次の行の開始時間を使用します。"
+        )
+        self._end_edit.time_changed.connect(self._on_end_changed)
+        time_row.addWidget(self._end_edit)
+        self._set_end_now_btn = QPushButton("⏱")
+        self._set_end_now_btn.setToolTip("再生中の時間を終了時間に設定")
+        self._set_end_now_btn.clicked.connect(self._set_end_to_now)
+        self._set_end_now_btn.setFixedWidth(32)
+        time_row.addWidget(self._set_end_now_btn)
         time_row.addStretch()
         layout.addLayout(time_row)
 
@@ -739,9 +920,16 @@ class LineEditor(QWidget):
         self._jp_edit = QTextEdit()
         self._jp_edit.setFixedHeight(60)
         self._jp_edit.setPlaceholderText("{東京|とうきょう}へ{行|い}く")
-        self._jp_edit.setFont(QFont("", 13))
+        self._jp_edit.setFont(QFont(_NOTO_JP or "", 13))
         self._jp_edit.setAcceptRichText(False)
+        self._jp_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._jp_edit.customContextMenuRequested.connect(self._jp_context_menu)
         jp_lay.addWidget(self._jp_edit)
+
+        # Ctrl+R shortcut for ruby annotation
+        sc_ruby = QShortcut(QKeySequence("Ctrl+R"), self._jp_edit)
+        sc_ruby.setContext(Qt.ShortcutContext.WidgetShortcut)
+        sc_ruby.activated.connect(self._insert_ruby)
         apply_jp_btn = QPushButton("↻ JP解析・ユニット表更新")
         apply_jp_btn.setToolTip("テキストを解析してユニット表を再生成します（既存の時間は上書きされます）")
         apply_jp_btn.clicked.connect(self._apply_jp)
@@ -802,6 +990,7 @@ class LineEditor(QWidget):
         if self._current_line is None:
             self._header.setText("（行を選択してください）")
             self._time_edit.set_ms(0)
+            self._end_edit.set_ms(0)
             self._jp_edit.setPlainText("")
             self._zh_edit.setText("")
             self._unit_table.setRowCount(0)
@@ -809,11 +998,16 @@ class LineEditor(QWidget):
 
         self._header.setText(f"行 {self._line_idx + 1}  /  {len(self._all_lines)}")
         self._time_edit.set_ms(self._current_line['start'])
+        self._end_edit.set_ms(
+            self._current_line.get('end',
+                                   line_end_ms(self._all_lines, self._line_idx))
+        )
         self._jp_edit.setPlainText(segments_to_markup(self._current_line.get('jp', [])))
         self._zh_edit.setText(self._current_line.get('zh', ''))
         self._refresh_unit_table()
 
     def _refresh_unit_table(self):
+        self._playing_row = -1   # table is being rebuilt; highlights are gone
         segs = self._current_line.get('jp', []) if self._current_line else []
         self._unit_table.blockSignals(True)
         self._unit_table.setRowCount(0)
@@ -824,7 +1018,7 @@ class LineEditor(QWidget):
                 self._unit_table.insertRow(row)
                 char_item = QTableWidgetItem(unit['k'])
                 char_item.setFlags(char_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                char_item.setFont(QFont("", 14))
+                char_item.setFont(QFont(_NOTO_JP or "", 14))
                 kind_item = QTableWidgetItem("ルビ" if is_ruby else "普通")
                 kind_item.setFlags(kind_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 kind_item.setForeground(QColor("#1a6aaa") if is_ruby else QColor("#888"))
@@ -836,10 +1030,62 @@ class LineEditor(QWidget):
                 self._unit_table.setItem(row, 3, e_item)
         self._unit_table.blockSignals(False)
 
+    # ── playhead highlight ──
+
+    def update_playhead(self, ms: int):
+        """Highlight the unit row whose time window contains ms.
+        Called on every QMediaPlayer.positionChanged signal."""
+        if self._current_line is None:
+            self._clear_unit_highlight()
+            return
+        t_start = self._current_line['start']
+        t_end = line_end_ms(self._all_lines, self._line_idx)
+        # Only act when playhead is inside this line's range
+        if ms < t_start or ms >= t_end:
+            self._clear_unit_highlight()
+            return
+        # Find matching row (first unit whose [s, e) contains ms)
+        new_row = -1
+        row = 0
+        for seg in self._current_line.get('jp', []):
+            for unit in seg.get('units', []):
+                if unit['s'] <= ms < unit['e']:
+                    new_row = row
+                row += 1
+            if new_row >= 0:
+                break
+        if new_row == self._playing_row:
+            return  # no change needed
+        self._clear_unit_highlight()
+        self._playing_row = new_row
+        if new_row >= 0 and new_row < self._unit_table.rowCount():
+            for col in range(self._unit_table.columnCount()):
+                item = self._unit_table.item(new_row, col)
+                if item:
+                    item.setBackground(QColor(255, 200, 60, 200))
+            self._unit_table.scrollToItem(
+                self._unit_table.item(new_row, 0),
+                QAbstractItemView.ScrollHint.EnsureVisible,
+            )
+
+    def _clear_unit_highlight(self):
+        if 0 <= self._playing_row < self._unit_table.rowCount():
+            for col in range(self._unit_table.columnCount()):
+                item = self._unit_table.item(self._playing_row, col)
+                if item:
+                    item.setData(Qt.ItemDataRole.BackgroundRole, None)
+        self._playing_row = -1
+
     def _on_time_changed(self, ms: int):
         if self._current_line is None:
             return
         self._current_line['start'] = ms
+        self.line_changed.emit()
+
+    def _on_end_changed(self, ms: int):
+        if self._current_line is None:
+            return
+        self._current_line['end'] = ms
         self.line_changed.emit()
 
     def _set_to_now(self):
@@ -850,19 +1096,75 @@ class LineEditor(QWidget):
         self._time_edit.set_ms(ms)
         self.line_changed.emit()
 
+    def _set_end_to_now(self):
+        if self._current_line is None:
+            return
+        ms = self._player.position() if (self._player and HAS_MULTIMEDIA) else 0
+        self._current_line['end'] = ms
+        self._end_edit.set_ms(ms)
+        self.line_changed.emit()
+
     def _on_zh_changed(self):
         if self._current_line is None:
             return
         self._current_line['zh'] = self._zh_edit.text()
         self.line_changed.emit()
 
+    def _insert_ruby(self):
+        """Wrap selected text as {selected|} and place cursor after |."""
+        cur = self._jp_edit.textCursor()
+        sel = cur.selectedText()
+        if sel:
+            cur.insertText("{" + sel + "|}")
+            # move cursor back one character (before closing })
+            cur.movePosition(cur.MoveOperation.Left, cur.MoveMode.MoveAnchor, 1)
+        else:
+            cur.insertText("{|}")
+            cur.movePosition(cur.MoveOperation.Left, cur.MoveMode.MoveAnchor, 2)
+        self._jp_edit.setTextCursor(cur)
+
+    def _jp_context_menu(self, pos):
+        menu = QMenu(self._jp_edit)
+        menu.setFont(QFont(_NOTO_JP or "", 10))
+
+        act_ruby = menu.addAction("注音を付ける\t(Ctrl+R)")
+        act_ruby.triggered.connect(self._insert_ruby)
+        menu.addSeparator()
+
+        std = self._jp_edit.createStandardContextMenu()
+        _label_map = {
+            "&Undo": "元に戻す",
+            "&Redo": "やり直す",
+            "Cu&t": "切り取り",
+            "&Copy": "コピー",
+            "&Paste": "貼り付け",
+            "Delete": "削除",
+            "Select All": "すべて選択",
+        }
+        for act in std.actions():
+            if act.isSeparator():
+                menu.addSeparator()
+            else:
+                text = act.text().replace("&", "").strip()
+                jp = next((v for k, v in _label_map.items()
+                           if k.replace("&", "") == text), None)
+                if jp:
+                    act.setText(jp)
+                menu.addAction(act)
+
+        menu.exec(self._jp_edit.mapToGlobal(pos))
+
     def _apply_jp(self):
         if self._current_line is None:
             return
         text = self._jp_edit.toPlainText().strip()
+        t_start = self._current_line['start']
         t_end = line_end_ms(self._all_lines, self._line_idx)
-        segs = parse_jp_markup(text, self._current_line['start'], t_end)
-        self._current_line['jp'] = segs
+        # Parse new markup (linear placeholder timing)
+        new_segs = parse_jp_markup(text, t_start, t_end)
+        # Preserve timing for unchanged characters via LCS diff
+        merged = merge_jp_timing(self._current_line.get('jp', []), new_segs, t_start, t_end)
+        self._current_line['jp'] = merged
         self._refresh_unit_table()
         self.line_changed.emit()
 
@@ -955,7 +1257,7 @@ class LyricsListPanel(QWidget):
         layout.addWidget(hdr)
 
         self._list = QListWidget()
-        self._list.setFont(QFont("", 11))
+        self._list.setFont(QFont(_NOTO_JP or "", 11))
         self._list.setAlternatingRowColors(True)
         self._list.currentRowChanged.connect(self.selection_changed)
         layout.addWidget(self._list)
@@ -1193,6 +1495,7 @@ class MainWindow(QMainWindow):
 
         self._lines: list = []
         self._save_path: Optional[str] = None
+        self._audio_path: Optional[str] = None
         self._dirty = False
         self._undo_stack: list = []
         self._redo_stack: list = []
@@ -1204,12 +1507,17 @@ class MainWindow(QMainWindow):
 
         # Waveform loader
         self._wf_loader: Optional[WaveformLoader] = None
+        self._pending_wf_zoom: Optional[float] = None
+        self._pending_wf_scroll: Optional[float] = None
 
         self._build_ui()
         self._build_shortcuts()
 
         if init_file:
-            self._load_lyrics(init_file)
+            if init_file.lower().endswith('.flproj'):
+                self._load_project(init_file)
+            else:
+                self._load_lyrics(init_file)
 
     # ─── UI construction ───
 
@@ -1232,21 +1540,25 @@ class MainWindow(QMainWindow):
         self._editor = LineEditor()
         self._editor.set_player(self._audio.get_player())
         self._editor.line_changed.connect(self._on_editor_changed)
+        # Wire player position → unit table playhead highlight
+        _pl = self._audio.get_player()
+        if _pl:
+            _pl.positionChanged.connect(self._editor.update_playhead)
 
         # Splitter
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._list_panel.setMinimumWidth(200)
-        self._list_panel.setMaximumWidth(300)
-        splitter.addWidget(self._list_panel)
-        splitter.addWidget(self._editor)
-        splitter.setSizes([220, 900])
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._list_panel.setMinimumWidth(150)
+        self._list_panel.setMaximumWidth(600)
+        self._splitter.addWidget(self._list_panel)
+        self._splitter.addWidget(self._editor)
+        self._splitter.setSizes([220, 900])
 
         # Central layout
         central = QWidget()
         cv = QVBoxLayout(central)
         cv.setContentsMargins(0, 0, 0, 0)
         cv.setSpacing(0)
-        cv.addWidget(splitter, 1)
+        cv.addWidget(self._splitter, 1)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
@@ -1259,8 +1571,83 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # Toolbar
-        tb = QToolBar("メイン")
+        # ── Row 1: Menu bar (file / LRC operations, collapsible) ──
+        mb = self.menuBar()
+        mb.setStyleSheet(
+            "QMenuBar{"
+            "background:#eef0f8;border-bottom:1px solid #d2d5ea;"
+            "padding:2px 8px;spacing:2px;"
+            "}"
+            "QMenuBar::item{"
+            "padding:4px 16px;border-radius:5px;background:transparent;"
+            "color:#2a2c3e;"
+            "}"
+            "QMenuBar::item:selected{background:#dde0f4;}"
+            "QMenuBar::item:pressed{background:#cdd0ec;}"
+            "QMenu{"
+            "background:#ffffff;border:1px solid #cdd0ea;"
+            "border-radius:8px;padding:5px 0;"
+            "}"
+            "QMenu::item{"
+            "padding:7px 36px 7px 20px;border-radius:4px;margin:1px 6px;"
+            "color:#1a1c2e;"
+            "}"
+            "QMenu::item:selected{background:#eaecf8;}"
+            "QMenu::item:disabled{color:#aaa;}"
+            "QMenu::separator{height:1px;background:#e4e7f2;margin:5px 12px;}"
+        )
+
+        _fm = mb.addMenu("ファイル")
+
+        _act_mp3 = QAction("音声を開く…", self)
+        _act_mp3.setToolTip("MP3 / WAV / FLAC などの音声ファイルを開く")
+        _act_mp3.triggered.connect(self._open_mp3)
+        _fm.addAction(_act_mp3)
+
+        _fm.addSeparator()
+
+        _act_new = QAction("新規", self)
+        _act_new.setToolTip("新しい歌詞ファイルを作成")
+        _act_new.triggered.connect(self._new_file)
+        _fm.addAction(_act_new)
+
+        _act_open = QAction("開く…", self)
+        _act_open.setShortcut(QKeySequence("Ctrl+O"))
+        _act_open.setToolTip("プロジェクト (.flproj) または歌詞 JSON (.json) を開く")
+        _act_open.triggered.connect(self._open_json)
+        _fm.addAction(_act_open)
+
+        self._save_act = QAction("保存", self)
+        self._save_act.setShortcut(QKeySequence("Ctrl+S"))
+        self._save_act.setToolTip("上書き保存")
+        self._save_act.triggered.connect(self._save)
+        _fm.addAction(self._save_act)
+
+        _act_save_as = QAction("名前で保存…", self)
+        _act_save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        _act_save_as.setToolTip("名前を付けて保存")
+        _act_save_as.triggered.connect(self._save_as)
+        _fm.addAction(_act_save_as)
+
+        _fm.addSeparator()
+
+        _act_lrc_in = QAction("LRC 読込…", self)
+        _act_lrc_in.setToolTip("標準 LRC をインポートして歌詞の底稿を作成")
+        _act_lrc_in.triggered.connect(self._import_lrc)
+        _fm.addAction(_act_lrc_in)
+
+        _act_lrc_out = QAction("LRC 書出…", self)
+        _act_lrc_out.setToolTip("現在の歌詞を標準 LRC としてエクスポート")
+        _act_lrc_out.triggered.connect(self._export_lrc)
+        _fm.addAction(_act_lrc_out)
+
+        _act_json_out = QAction("歌詞 JSON として書出…", self)
+        _act_json_out.setToolTip("現在の歌詞データを純粋な JSON ファイルに書き出す")
+        _act_json_out.triggered.connect(self._export_json)
+        _fm.addAction(_act_json_out)
+
+        # ── Row 2: Toolbar (editing tools, always visible) ──
+        tb = QToolBar("編集")
         tb.setIconSize(QSize(20, 20))
         tb.setMovable(False)
         self.addToolBar(tb)
@@ -1274,30 +1661,19 @@ class MainWindow(QMainWindow):
             tb.addAction(a)
             return a
 
-        add_act("📂 MP3", "MP3ファイルを開く", self._open_mp3)
-        tb.addSeparator()
-        add_act("📄 新規", "新しい歌詞ファイル", self._new_file)
-        add_act("📂 開く", "歌詞JSONを開く", self._open_json, "Ctrl+O")
-        self._save_act = add_act("💾 保存", "保存", self._save, "Ctrl+S")
-        add_act("💾 名前で保存", "名前を付けて保存", self._save_as, "Ctrl+Shift+S")
-        tb.addSeparator()
-
-        self._undo_act = add_act("↩ 元に戻す", "Undo", self._undo, "Ctrl+Z")
-        self._redo_act = add_act("↪ やり直し", "Redo", self._redo, "Ctrl+Y")
+        self._undo_act = add_act("↩ 元に戻す", "Undo (Ctrl+Z)", self._undo, "Ctrl+Z")
+        self._redo_act = add_act("↪ やり直し", "Redo (Ctrl+Y)", self._redo, "Ctrl+Y")
         tb.addSeparator()
 
         # Tap mode button
         self._tap_act = QAction("🎵 行打拍モード", self)
         self._tap_act.setToolTip(
-            "行打拍モード: 再生中にEnterで各行の開始時間を自動設定\n"
+            "行打拍モード: 再生中に Enter で各行の開始時間を自動設定\n"
             "BS: 1つ戻す  |  Esc: 終了"
         )
         self._tap_act.setCheckable(True)
         self._tap_act.triggered.connect(self._toggle_tap_mode)
         tb.addAction(self._tap_act)
-        tb.addSeparator()
-        add_act("📥 LRC読込", "標準LRCファイルをインポートして歌詞の底稿を作成", self._import_lrc)
-        add_act("📤 LRC書出", "現在の歌詞を標準LRCファイルとしてエクスポート", self._export_lrc)
 
         # Status bar
         self._status = self.statusBar()
@@ -1359,15 +1735,39 @@ class MainWindow(QMainWindow):
         sc_add.setContext(Qt.ShortcutContext.ApplicationShortcut)
         sc_add.activated.connect(self._add_line)
 
+    # ─── file dialog helpers ───
+
+    @staticmethod
+    def _open_file_dialog(parent, title, directory, filters):
+        dlg = QFileDialog(parent, title, directory, filters)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dlg.resize(680, 420)
+        if dlg.exec():
+            files = dlg.selectedFiles()
+            return (files[0] if files else "", dlg.selectedNameFilter())
+        return ("", "")
+
+    @staticmethod
+    def _save_file_dialog(parent, title, directory, filters):
+        dlg = QFileDialog(parent, title, directory, filters)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dlg.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dlg.resize(680, 420)
+        if dlg.exec():
+            files = dlg.selectedFiles()
+            return (files[0] if files else "", dlg.selectedNameFilter())
+        return ("", "")
+
     # ─── file ops ───
 
     def _open_mp3(self):
-        path, _ = QFileDialog.getOpenFileName(
+        path, _ = self._open_file_dialog(
             self, "MP3ファイルを開く", "",
             "Audio Files (*.mp3 *.m4a *.ogg *.wav *.flac);;All Files (*)"
         )
         if not path:
             return
+        self._audio_path = path
         self._audio.load_audio(path)
         self._status.showMessage(f"音声: {Path(path).name}")
 
@@ -1382,6 +1782,13 @@ class MainWindow(QMainWindow):
     def _on_waveform_loaded(self, samples, sr: int):
         if samples is not None:
             self._audio.waveform.set_audio(samples, sr)
+            # Restore zoom/scroll saved in project file (set_audio resets them)
+            if self._pending_wf_zoom is not None:
+                self._audio.waveform._zoom = self._pending_wf_zoom
+                self._audio.waveform._scroll_ms = self._pending_wf_scroll or 0.0
+                self._pending_wf_zoom = None
+                self._pending_wf_scroll = None
+                self._audio.waveform.update()
             self._status.showMessage("波形読み込み完了")
         else:
             self._status.showMessage("波形の読み込み失敗（librosa/soundfile が必要です）")
@@ -1403,11 +1810,15 @@ class MainWindow(QMainWindow):
         if self._dirty:
             if not self._confirm_discard():
                 return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "歌詞JSONを開く", "", "JSON Files (*.json);;All Files (*)"
+        path, _ = self._open_file_dialog(
+            self, "ファイルを開く", self._save_path or "",
+            "プロジェクト・歌詞 (*.flproj *.json);;プロジェクト (*.flproj);;JSON歌詞 (*.json);;All Files (*)"
         )
         if path:
-            self._load_lyrics(path)
+            if path.lower().endswith('.flproj'):
+                self._load_project(path)
+            else:
+                self._load_lyrics(path)
 
     def _load_lyrics(self, path: str):
         try:
@@ -1435,17 +1846,24 @@ class MainWindow(QMainWindow):
         self._write(self._save_path)
 
     def _save_as(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "名前を付けて保存", self._save_path or "lyrics.json",
-            "JSON Files (*.json);;All Files (*)"
+        default = self._save_path or "project.flproj"
+        path, _ = self._save_file_dialog(
+            self, "名前を付けて保存", default,
+            "プロジェクト (*.flproj);;JSON歌詞 (*.json);;All Files (*)"
         )
         if path:
-            if not path.endswith('.json'):
-                path += '.json'
+            if not (path.lower().endswith('.flproj') or path.lower().endswith('.json')):
+                path += '.flproj'
             self._save_path = path
             self._write(path)
 
     def _write(self, path: str):
+        if path.lower().endswith('.flproj'):
+            self._write_project(path)
+        else:
+            self._write_json(path)
+
+    def _write_json(self, path: str):
         try:
             data = {"lines": self._lines}
             Path(path).write_text(
@@ -1457,6 +1875,105 @@ class MainWindow(QMainWindow):
             self._status.showMessage(f"保存しました: {path}")
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", str(e))
+
+    def _write_project(self, path: str):
+        try:
+            geom = self.geometry()
+            data = {
+                "flproj_version": 1,
+                "audio_path": self._audio_path or "",
+                "lines": self._lines,
+                "window": {
+                    "x": geom.x(), "y": geom.y(),
+                    "w": geom.width(), "h": geom.height(),
+                },
+                "splitter_sizes": self._splitter.sizes(),
+                "waveform": {
+                    "zoom": self._audio.waveform._zoom,
+                    "scroll_ms": self._audio.waveform._scroll_ms,
+                },
+                "options": {
+                    "speed_idx": (self._audio._speed_combo.currentIndex()
+                                  if self._audio._speed_combo else 2),
+                    "volume": (self._audio._vol_slider.value()
+                               if hasattr(self._audio, '_vol_slider') else 100),
+                },
+            }
+            Path(path).write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                "utf-8"
+            )
+            self._dirty = False
+            self.setWindowTitle(f"furi-lrc-gui — {Path(path).name}")
+            self._status.showMessage(f"プロジェクトを保存しました: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "保存エラー", str(e))
+
+    def _load_project(self, path: str):
+        try:
+            raw = json.loads(Path(path).read_text("utf-8"))
+            if raw.get("flproj_version") != 1:
+                raise ValueError("未対応のプロジェクトバージョンです")
+            lines = raw.get("lines", [])
+            if not isinstance(lines, list):
+                raise ValueError("lines は配列である必要があります")
+            lines.sort(key=lambda x: x.get('start', 0))
+            self._lines = lines
+            self._save_path = path
+            self._dirty = False
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            # Restore window geometry
+            win = raw.get("window", {})
+            if win:
+                self.setGeometry(
+                    win.get("x", self.x()),
+                    win.get("y", self.y()),
+                    win.get("w", self.width()),
+                    win.get("h", self.height()),
+                )
+            # Restore splitter
+            sizes = raw.get("splitter_sizes")
+            if sizes and len(sizes) == 2:
+                self._splitter.setSizes(sizes)
+            # Schedule waveform view restore (applied after waveform loads)
+            wf = raw.get("waveform", {})
+            if wf:
+                self._pending_wf_zoom = max(1.0, float(wf.get("zoom", 1.0)))
+                self._pending_wf_scroll = max(0.0, float(wf.get("scroll_ms", 0.0)))
+            # Restore options
+            opts = raw.get("options", {})
+            if self._audio._speed_combo:
+                idx = opts.get("speed_idx", 2)
+                self._audio._speed_combo.setCurrentIndex(
+                    max(0, min(idx, self._audio._speed_combo.count() - 1))
+                )
+            if hasattr(self._audio, '_vol_slider'):
+                self._audio._vol_slider.setValue(opts.get("volume", 100))
+            # Load audio
+            audio_path = raw.get("audio_path", "")
+            audio_ok = False
+            if audio_path:
+                p = Path(audio_path)
+                if not p.is_absolute():
+                    p = Path(path).parent / p
+                if p.exists():
+                    audio_ok = True
+                    self._audio_path = str(p)
+                    self._audio.load_audio(str(p))
+                    if self._wf_loader:
+                        self._wf_loader.quit()
+                    self._wf_loader = WaveformLoader(str(p))
+                    self._wf_loader.finished.connect(self._on_waveform_loaded)
+                    self._wf_loader.start()
+            self._refresh_all()
+            self.setWindowTitle(f"furi-lrc-gui — {Path(path).name}")
+            msg = f"プロジェクト読み込み完了: {Path(path).name}  ({len(lines)} 行)"
+            if audio_path and not audio_ok:
+                msg += f"  ⚠ 音声ファイルが見つかりません: {audio_path}"
+            self._status.showMessage(msg)
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"プロジェクトを読み込めませんでした:\n{e}")
 
     def _confirm_discard(self) -> bool:
         r = QMessageBox.question(
@@ -1713,7 +2230,7 @@ class MainWindow(QMainWindow):
         if self._dirty:
             if not self._confirm_discard():
                 return
-        path, _ = QFileDialog.getOpenFileName(
+        path, _ = self._open_file_dialog(
             self, "LRCファイルを開く", "",
             "LRC Files (*.lrc);;All Files (*)"
         )
@@ -1749,7 +2266,7 @@ class MainWindow(QMainWindow):
             Path(self._save_path).stem + ".lrc"
             if self._save_path else "lyrics.lrc"
         )
-        path, _ = QFileDialog.getSaveFileName(
+        path, _ = self._save_file_dialog(
             self, "LRCとして保存", default_name,
             "LRC Files (*.lrc);;All Files (*)"
         )
@@ -1763,6 +2280,32 @@ class MainWindow(QMainWindow):
             self._status.showMessage(f"LRCエクスポート完了: {path}")
         except Exception as e:
             QMessageBox.critical(self, "LRC書出エラー", str(e))
+
+    def _export_json(self):
+        if not self._lines:
+            QMessageBox.warning(self, "JSON書出", "歌詞データが空です。")
+            return
+        stem = Path(self._save_path).stem if self._save_path else "lyrics"
+        # Strip .flproj suffix so default name is clean
+        if stem.lower().endswith('.flproj'):
+            stem = stem[:-7]
+        default_name = stem + ".json"
+        path, _ = self._save_file_dialog(
+            self, "歌詞 JSON として保存", default_name,
+            "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith('.json'):
+            path += '.json'
+        try:
+            Path(path).write_text(
+                json.dumps({"lines": self._lines}, ensure_ascii=False, indent=2),
+                'utf-8'
+            )
+            self._status.showMessage(f"JSON書出完了: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "JSON書出エラー", str(e))
 
     # ─── close ───
 
@@ -1803,7 +2346,9 @@ def main():
     _fid = QFontDatabase.addApplicationFont(_font_path)
     _families = QFontDatabase.applicationFontFamilies(_fid)
     if _families:
-        app.setFont(QFont(_families[0], 10))
+        global _NOTO_JP
+        _NOTO_JP = _families[0]
+        app.setFont(QFont(_NOTO_JP, 10))
 
     # ── Light (day) palette ──
     pal = QPalette()

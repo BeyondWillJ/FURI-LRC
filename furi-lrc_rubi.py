@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """furi-lrc — karaoke lyrics overlay for Windows 11
-PyQt6 + QWebEngineView · bilingual JP/ZH · furigana · mora-level karaoke sweep
+PyQt6 QPainter · bilingual JP/ZH · furigana · mora-level karaoke sweep (native)
 """
 
 import sys
 import json
+import re
 import time
 import ctypes
 import asyncio
 import threading
 import datetime
+import dataclasses
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QDialog,
@@ -18,10 +21,13 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QColorDialog, QPushButton, QFileDialog,
     QSpinBox, QCheckBox,
 )
-from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEngineSettings
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint, QPropertyAnimation, QEasingCurve, QUrl
-from PyQt6.QtGui import QColor, QCursor, QPainter, QPen, QFontDatabase, QFont
+from PyQt6.QtCore import (
+    Qt, QTimer, pyqtSignal, QObject, QPoint, QPointF, QRectF, QRect,
+    QPropertyAnimation, QEasingCurve,
+)
+from PyQt6.QtGui import (
+    QColor, QCursor, QPainter, QPen, QFontDatabase, QFont, QFontMetricsF,
+)
 
 # ── winrt SMTC (optional) ───
 WINRT_AVAILABLE = False
@@ -52,11 +58,10 @@ def load_config() -> dict:
     if CONFIG_PATH.exists():
         try:
             cfg = {**DEFAULT_CFG, **json.loads(CONFIG_PATH.read_text("utf-8"))}
-            # If font values are not file paths (e.g. old config stored family names), reset to default
             for key in ("font_jp", "font_zh"):
                 val = cfg[key]
                 p = Path(val) if Path(val).is_absolute() else Path(__file__).parent / val
-                if not p.suffix.lower() in {".ttf", ".otf", ".ttc", ".woff", ".woff2"}:
+                if p.suffix.lower() not in {".ttf", ".otf", ".ttc", ".woff", ".woff2"}:
                     cfg[key] = DEFAULT_CFG[key]
             return cfg
         except Exception:
@@ -112,12 +117,11 @@ class SMTCWorker(QObject):
 
                 tl      = sess.get_timeline_properties()
                 pb      = sess.get_playback_info()
-                playing = int(pb.playback_status) == 3  # MediaPlaybackStatus.Playing = 3
+                playing = int(pb.playback_status) == 3
 
                 pos = tl.position
                 sec = pos.total_seconds() if hasattr(pos, "total_seconds") else float(pos) / 1e7
 
-                # Interpolate: SMTC position is a snapshot, add elapsed time since snapshot
                 if playing:
                     lu = tl.last_updated_time
                     now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -125,10 +129,9 @@ class SMTCWorker(QObject):
                         if isinstance(lu, datetime.datetime):
                             elapsed = (now_utc - lu).total_seconds()
                         else:
-                            # Windows FILETIME (100-ns ticks since 1601-01-01)
                             ft_epoch = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
-                            lu_utc = ft_epoch + datetime.timedelta(microseconds=int(lu) / 10)
-                            elapsed = (now_utc - lu_utc).total_seconds()
+                            lu_utc   = ft_epoch + datetime.timedelta(microseconds=int(lu) / 10)
+                            elapsed  = (now_utc - lu_utc).total_seconds()
                         sec = max(0.0, sec + elapsed)
                     except Exception:
                         pass
@@ -139,279 +142,353 @@ class SMTCWorker(QObject):
             await asyncio.sleep(0.2)
 
 
-# ── HTML/CSS/JS page ───
-_HTML = r"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-:root {
-  --sung:        #4fc3f7;
-  --unsung:      #888;
-  --zh:          #aaa;
-  --font-jp:     "FuriLrcJP", serif;
-  --font-zh:     "FuriLrcZH", sans-serif;
-  --fsize-jp:    20px;
-  --fsize-zh:    14px;
-  --spacing-zh:  -8px;
-  --text-shadow: 2px 2px 8px rgba(0,0,0,0.85);
-}
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html, body {
-  background: transparent;
-  width: 100%; height: 100%;
-  overflow: hidden;
-}
-#wrap {
-  width: 100%; height: 100%;
-  position: relative;
-  overflow: hidden;
-}
-.line {
-  position: absolute;
-  left: 0; right: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  text-align: center;
-  padding: 0 18px;
-  line-height: 2.8;
-  opacity: 0;
-  transition: opacity 0.35s ease;
-}
-.line.active { opacity: 1; }
-.jp { font-family: var(--font-jp); font-size: var(--fsize-jp); font-weight: 600; }
-.zh {
-  font-family: var(--font-zh);
-  font-size: var(--fsize-zh);
-  color: var(--zh);
-  text-shadow: var(--text-shadow);
-  display: block;
-  margin-top: var(--spacing-zh);
-  padding-bottom: 0.25em;
-}
-ruby { ruby-align: center; display: ruby; }
-rt   { font-size: 0.5em; display: ruby-text; ruby-align: center; }
-/* Karaoke sweep: per-frame JS writes --p (0→1); gradient reveals the sung color */
-.unit {
-  display: inline-block;
-  background: linear-gradient(
-    90deg,
-    var(--sung)   0%,
-    var(--sung)   calc(var(--p, 0) * 100%),
-    var(--unsung) calc(var(--p, 0) * 100%),
-    var(--unsung) 100%
-  );
-  -webkit-background-clip: text;
-          background-clip: text;
-  color: transparent;
-}
-ruby > span.unit { display: inline; }    /* base kanji must stay inline for ruby layout */
-#placeholder {
-  position: absolute;
-  left: 0; right: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  font-family: var(--font-jp);
-  font-size: var(--fsize-jp);
-  color: var(--unsung);
-  text-align: center;
-  opacity: 0.4;
-}
-</style>
-</head>
-<body>
-<div id="wrap">
-  <div id="placeholder">歌詞ファイルをドロップまたは右クリックで開く</div>
-</div>
-<script>
-"use strict";
+# ── Layout data structures ──
 
-let lyrics  = [];
-let syncSec = 0, syncWall = 0, playing = false;
-let activeI = -1;
-/* _cache[li] = flat array of {el, u, rubyUnits}
-   u          → plain kana / furigana mora  (set --p from u.s/u.e)
-   rubyUnits  → ruby base kanji             (set --p = avg of its mora progress) */
-let _cache  = [];
-
-/* ── Public API ── */
-
-function loadLyrics(data) {
-  lyrics  = data;
-  activeI = -1;
-  _cache  = [];
-  buildDOM();
-}
-
-function syncTime(sec, isPlaying) {
-  syncSec  = sec;
-  syncWall = performance.now();
-  playing  = isPlaying;
-}
-
-function setTheme(sung, unsung, zh, fontJP, fontZH, fsizeJP, fsizeZH, spacingZH, shadow) {
-  const r = document.documentElement.style;
-  r.setProperty('--sung',        sung);
-  r.setProperty('--unsung',      unsung);
-  r.setProperty('--zh',          zh);
-  r.setProperty('--font-jp',     '"' + fontJP + '", serif');
-  r.setProperty('--font-zh',     '"' + fontZH + '", sans-serif');
-  r.setProperty('--fsize-jp',    fsizeJP + 'px');
-  r.setProperty('--fsize-zh',    fsizeZH + 'px');
-  r.setProperty('--spacing-zh',  spacingZH + 'px');
-  r.setProperty('--text-shadow', shadow || 'none');
-}
-
-/* ── DOM builder (also populates element cache) ── */
-
-function buildDOM() {
-  const wrap = document.getElementById('wrap');
-  wrap.innerHTML = '';
-  lyrics.forEach((line, li) => {
-    const d = document.createElement('div');
-    d.className = 'line';
-    d.id = 'L' + li;
-    buildJP(d, li, line.jp);
-    if (line.zh) {
-      const zh = document.createElement('div');
-      zh.className = 'zh';
-      zh.textContent = line.zh;
-      d.appendChild(zh);
-    }
-    wrap.appendChild(d);
-  });
-}
-
-function buildJP(parent, li, segs) {
-  const jp    = document.createElement('div');
-  jp.className = 'jp';
-  const lineCache = [];
-  segs.forEach((seg) => {
-    if (seg.ruby) {
-      const ruby = document.createElement('ruby');
-      /* Base kanji span — progress = average of its mora progress */
-      const base = document.createElement('span');
-      base.className = 'unit';
-      base.style.setProperty('--p', '0');
-      base.textContent = seg.base;
-      ruby.appendChild(base);
-      lineCache.push({ el: base, u: null, rubyUnits: seg.units });
-      /* Furigana mora spans — each has its own timing */
-      const rt = document.createElement('rt');
-      seg.units.forEach((u) => {
-        const s = document.createElement('span');
-        s.className = 'unit';
-        s.style.setProperty('--p', '0');
-        s.textContent = u.k;
-        rt.appendChild(s);
-        lineCache.push({ el: s, u: u, rubyUnits: null });
-      });
-      ruby.appendChild(rt);
-      jp.appendChild(ruby);
-    } else {
-      seg.units.forEach((u) => {
-        const s = document.createElement('span');
-        s.className = 'unit';
-        s.style.setProperty('--p', '0');
-        s.textContent = u.k;
-        jp.appendChild(s);
-        lineCache.push({ el: s, u: u, rubyUnits: null });
-      });
-    }
-  });
-  _cache[li] = lineCache;
-  parent.appendChild(jp);
-}
-
-/* ── Per-frame karaoke sweep ── */
-
-function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
-
-function nowMs() {
-  const drift = playing ? (performance.now() - syncWall) : 0;
-  return syncSec * 1000 + drift;
-}
-
-function findLine(ms) {
-  let idx = -1;
-  for (let i = 0; i < lyrics.length; i++) {
-    if (lyrics[i].start <= ms) idx = i; else break;
-  }
-  return idx;
-}
-
-function updateLine(li, ms) {
-  const lineCache = _cache[li];
-  if (!lineCache) return;
-  for (const entry of lineCache) {
-    let p;
-    if (entry.rubyUnits !== null) {
-      /* Ruby base kanji: fill in proportion to how many of its morae have been sung */
-      let sum = 0;
-      for (const u of entry.rubyUnits) {
-        sum += clamp01((ms - u.s) / Math.max(1, u.e - u.s));
-      }
-      p = clamp01(sum / entry.rubyUnits.length);
-    } else {
-      const u = entry.u;
-      p = clamp01((ms - u.s) / Math.max(1, u.e - u.s));
-    }
-    entry.el.style.setProperty('--p', p);
-  }
-}
-
-function sweep() {
-  if (lyrics.length > 0) {
-    const ms = nowMs();
-    const li = findLine(ms);
-
-    /* Line-level fade in/out */
-    if (li !== activeI) {
-      if (activeI >= 0) {
-        const prev = document.getElementById('L' + activeI);
-        if (prev) prev.classList.remove('active');
-      }
-      if (li >= 0) {
-        const cur = document.getElementById('L' + li);
-        if (cur) cur.classList.add('active');
-      }
-      activeI = li;
-    }
-
-    /* Per-glyph karaoke sweep — runs every frame */
-    if (li >= 0) updateLine(li, ms);
-  }
-  requestAnimationFrame(sweep);
-}
-
-requestAnimationFrame(sweep);
-</script>
-</body>
-</html>
-"""
+@dataclasses.dataclass
+class _MoraDraw:
+    x:     float   # x offset from line's left edge (unscaled)
+    w:     float   # advance width (unscaled)
+    text:  str
+    s_ms:  float
+    e_ms:  float
+    is_rt: bool    # True = furigana mora (drawn above jp baseline)
 
 
-def _resolve_font_uri(path_str: str) -> str:
-    p = Path(path_str)
-    if not p.is_absolute():
-        p = Path(__file__).parent / p
-    return p.as_uri()
+@dataclasses.dataclass
+class _KanjiDraw:
+    x:          float
+    w:          float
+    text:       str
+    mora_refs:  List[_MoraDraw]   # furigana morae for averaging progress
 
 
-def _build_html(cfg: dict) -> str:
-    jp_url = _resolve_font_uri(cfg["font_jp"])
-    zh_url = _resolve_font_uri(cfg["font_zh"])
-    font_face = (
-        f'@font-face {{\n'
-        f'  font-family: "FuriLrcJP";\n'
-        f'  src: url("{jp_url}") format("truetype");\n'
-        f'}}\n'
-        f'@font-face {{\n'
-        f'  font-family: "FuriLrcZH";\n'
-        f'  src: url("{zh_url}") format("truetype");\n'
-        f'}}\n'
+@dataclasses.dataclass
+class _LineLayout:
+    morae:   List[_MoraDraw]
+    kanjis:  List[_KanjiDraw]
+    zh_text: str
+    zh_w:    float
+    total_w: float
+
+
+# ── Pure helpers ──
+
+def _clamp01(v: float) -> float:
+    return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+
+
+def _mora_progress(m: _MoraDraw, ms: float) -> float:
+    return _clamp01((ms - m.s_ms) / max(1.0, m.e_ms - m.s_ms))
+
+
+def _kanji_progress(k: _KanjiDraw, ms: float) -> float:
+    if not k.mora_refs:
+        return 0.0
+    return sum(_mora_progress(m, ms) for m in k.mora_refs) / len(k.mora_refs)
+
+
+def _parse_shadow(s: str) -> Optional[Tuple[float, float, QColor]]:
+    """Parse a CSS text-shadow value to (dx, dy, QColor) or None."""
+    if not s or s.lower() == "none":
+        return None
+    nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+    dx = float(nums[0]) if len(nums) > 0 else 2.0
+    dy = float(nums[1]) if len(nums) > 1 else 2.0
+    rgba_m = re.search(
+        r"rgba?\s*\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)", s
     )
-    return _HTML.replace("<style>", "<style>\n" + font_face, 1)
+    if rgba_m:
+        r, g, b = float(rgba_m.group(1)), float(rgba_m.group(2)), float(rgba_m.group(3))
+        a = float(rgba_m.group(4)) if rgba_m.group(4) else 1.0
+        color = QColor(int(r), int(g), int(b), int(a * 255))
+    else:
+        hex_m = re.search(r"#[0-9a-fA-F]{3,8}", s)
+        color  = QColor(hex_m.group()) if hex_m else QColor(0, 0, 0, 200)
+    return (dx, dy, color)
+
+
+def _load_qt_font(path_str: str, size: int,
+                  weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
+    if path_str:
+        p = Path(path_str)
+        if not p.is_absolute():
+            p = Path(__file__).parent / p
+        fid      = QFontDatabase.addApplicationFont(str(p))
+        families = QFontDatabase.applicationFontFamilies(fid)
+        if families:
+            f = QFont(families[0])
+            f.setPixelSize(size)
+            f.setWeight(weight)
+            return f
+    f = QFont()
+    f.setPixelSize(size)
+    f.setWeight(weight)
+    return f
+
+
+# ── Native QPainter canvas ──
+
+class LyricsCanvas(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        self._cfg:     dict              = {}
+        self._lyrics:  list              = []
+        self._layouts: List[_LineLayout] = []
+
+        self._base_ms:    float = 0.0
+        self._base_wall:  float = time.monotonic()
+        self._playing:    bool  = False
+        self._active_i:   int   = -1
+        self._fade_alpha: float = 0.0
+        self._fade_target: float = 1.0
+
+        self._font_jp = QFont()
+        self._font_rt = QFont()
+        self._font_zh = QFont()
+        self._fm_jp   = QFontMetricsF(self._font_jp)
+        self._fm_rt   = QFontMetricsF(self._font_rt)
+        self._fm_zh   = QFontMetricsF(self._font_zh)
+
+        self._frame_timer = QTimer(self)
+        self._frame_timer.setInterval(16)
+        self._frame_timer.timeout.connect(self._tick)
+        self._frame_timer.start()
+
+    # ── Clock & state ──
+
+    def sync_time(self, sec: float, playing: bool) -> None:
+        self._base_ms   = sec * 1000.0
+        self._base_wall = time.monotonic()
+        self._playing   = playing
+
+    def _now_ms(self) -> float:
+        if self._playing:
+            return self._base_ms + (time.monotonic() - self._base_wall) * 1000.0
+        return self._base_ms
+
+    def _tick(self) -> None:
+        step = 0.07   # ~240 ms to full opacity at 16 ms/frame
+        diff = self._fade_target - self._fade_alpha
+        if abs(diff) < step:
+            self._fade_alpha = self._fade_target
+        else:
+            self._fade_alpha += step if diff > 0 else -step
+        self.update()
+
+    # ── Config & font handling ──
+
+    def apply_cfg(self, cfg: dict) -> None:
+        prev = self._cfg
+        self._cfg = cfg
+        font_changed = (
+            cfg.get("font_jp")      != prev.get("font_jp")      or
+            cfg.get("font_zh")      != prev.get("font_zh")      or
+            cfg.get("font_size_jp") != prev.get("font_size_jp") or
+            cfg.get("font_size_zh") != prev.get("font_size_zh") or
+            not prev
+        )
+        if font_changed:
+            self._rebuild_fonts()
+            self._rebuild_layouts()
+        self.update()
+
+    def _rebuild_fonts(self) -> None:
+        cfg     = self._cfg
+        sz_jp   = cfg.get("font_size_jp", 20)
+        sz_rt   = max(8, sz_jp // 2)
+        sz_zh   = cfg.get("font_size_zh", 14)
+        jp_path = cfg.get("font_jp", "")
+        zh_path = cfg.get("font_zh", "")
+        self._font_jp = _load_qt_font(jp_path, sz_jp, QFont.Weight.DemiBold)
+        self._font_rt = _load_qt_font(jp_path, sz_rt, QFont.Weight.DemiBold)
+        self._font_zh = _load_qt_font(zh_path, sz_zh, QFont.Weight.Normal)
+        self._fm_jp   = QFontMetricsF(self._font_jp)
+        self._fm_rt   = QFontMetricsF(self._font_rt)
+        self._fm_zh   = QFontMetricsF(self._font_zh)
+
+    # ── Lyrics loading & layout ──
+
+    def load_lyrics(self, lines: list) -> None:
+        self._lyrics   = lines
+        self._active_i  = -1
+        self._fade_alpha = 0.0
+        self._rebuild_layouts()
+        self.update()
+
+    def _rebuild_layouts(self) -> None:
+        self._layouts = [self._layout_line(ln) for ln in self._lyrics]
+
+    def _layout_line(self, line: dict) -> _LineLayout:
+        segs    = line.get("jp", [])
+        zh_text = line.get("zh", "")
+        fm_jp   = self._fm_jp
+        fm_rt   = self._fm_rt
+        fm_zh   = self._fm_zh
+
+        morae:  List[_MoraDraw]  = []
+        kanjis: List[_KanjiDraw] = []
+        x = 0.0
+
+        for seg in segs:
+            units = seg.get("units", [])
+            if seg.get("ruby"):
+                base  = seg.get("base", "")
+                furi  = "".join(u["k"] for u in units)
+                Wb    = fm_jp.horizontalAdvance(base)
+                Wr    = fm_rt.horizontalAdvance(furi)
+                Wc    = max(Wb, Wr)
+                kanji_x = x + (Wc - Wb) / 2
+                furi_x  = x + (Wc - Wr) / 2
+                seg_morae: List[_MoraDraw] = []
+                cx = furi_x
+                for u in units:
+                    mw = fm_rt.horizontalAdvance(u["k"])
+                    m  = _MoraDraw(x=cx, w=mw, text=u["k"],
+                                   s_ms=float(u["s"]), e_ms=float(u["e"]), is_rt=True)
+                    morae.append(m)
+                    seg_morae.append(m)
+                    cx += mw
+                kanjis.append(_KanjiDraw(x=kanji_x, w=Wb, text=base, mora_refs=seg_morae))
+                x += Wc
+            else:
+                for u in units:
+                    uw = fm_jp.horizontalAdvance(u["k"])
+                    m  = _MoraDraw(x=x, w=uw, text=u["k"],
+                                   s_ms=float(u["s"]), e_ms=float(u["e"]), is_rt=False)
+                    morae.append(m)
+                    x += uw
+
+        zh_w = fm_zh.horizontalAdvance(zh_text) if zh_text else 0.0
+        return _LineLayout(morae=morae, kanjis=kanjis,
+                           zh_text=zh_text, zh_w=zh_w, total_w=x)
+
+    # ── Painting ──
+
+    def paintEvent(self, _) -> None:  # noqa: N802
+        if not self._lyrics or not self._layouts:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+            if self._cfg:
+                painter.setFont(self._font_jp)
+            painter.setPen(QColor(136, 136, 136, 100))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             "歌詞ファイルをドロップまたは右クリックで開く")
+            return
+
+        ms = self._now_ms()
+
+        # Find active line
+        li = -1
+        for i, ln in enumerate(self._lyrics):
+            if ln.get("start", 0) <= ms:
+                li = i
+            else:
+                break
+
+        if li != self._active_i:
+            self._active_i   = li
+            self._fade_alpha  = 0.0
+            self._fade_target = 1.0
+
+        if li < 0 or li >= len(self._layouts):
+            return
+
+        layout = self._layouts[li]
+        cfg    = self._cfg
+        W, H   = self.width(), self.height()
+        has_zh = bool(layout.zh_text)
+
+        # ── y geometry (recomputed from current height each frame) ──
+        fm_jp   = self._fm_jp
+        fm_rt   = self._fm_rt
+        fm_zh   = self._fm_zh
+        rt_h    = fm_rt.ascent() + fm_rt.descent()
+        gap     = 2.0
+        spacing = float(cfg.get("spacing_zh", -8))
+
+        if has_zh:
+            block_h = (rt_h + gap + fm_jp.ascent() + fm_jp.descent()
+                       + spacing + fm_zh.ascent() + fm_zh.descent())
+        else:
+            block_h = rt_h + gap + fm_jp.ascent() + fm_jp.descent()
+
+        top_y     = (H - block_h) / 2
+        rt_base_y = top_y + rt_h
+        jp_base_y = rt_base_y + gap + fm_jp.ascent()
+        zh_base_y = (jp_base_y + fm_jp.descent() + spacing + fm_zh.ascent()
+                     if has_zh else 0.0)
+
+        # ── horizontal: center + scale-down on overflow ──
+        pad   = 18.0
+        avail = W - 2 * pad
+        scale = min(1.0, avail / layout.total_w) if layout.total_w > 1 else 1.0
+        x_off = pad + (avail - layout.total_w * scale) / 2
+
+        shadow       = _parse_shadow(cfg.get("text_shadow", ""))
+        color_sung   = QColor(cfg.get("color_sung",   "#4fc3f7"))
+        color_unsung = QColor(cfg.get("color_unsung", "#888888"))
+        color_zh_c   = QColor(cfg.get("color_zh",     "#aaaaaa"))
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        painter.setOpacity(self._fade_alpha)
+
+        # Two-pass draw for one unit: unsung fill, then clip to sung portion
+        def draw_unit(font: QFont, x: float, y: float, w: float, text: str, p: float) -> None:
+            if shadow:
+                dx, dy, sc = shadow
+                painter.setFont(font)
+                painter.setPen(sc)
+                painter.drawText(QPointF(x + dx, y + dy), text)
+            painter.setFont(font)
+            painter.setPen(color_unsung)
+            painter.drawText(QPointF(x, y), text)
+            if p > 0.0:
+                painter.save()
+                painter.setClipRect(QRectF(x, -1.0, w * p, float(H) / max(scale, 0.01) + 2.0))
+                painter.setPen(color_sung)
+                painter.drawText(QPointF(x, y), text)
+                painter.restore()
+
+        # Uniform scale-down on overflow — preserves glyph aspect ratio
+        painter.save()
+        if scale < 1.0:
+            # Translate so the block stays vertically centred after uniform scale
+            painter.translate(x_off, H / 2.0 * (1.0 - scale))
+            painter.scale(scale, scale)
+        else:
+            painter.translate(x_off, 0.0)
+
+        for m in layout.morae:
+            draw_unit(
+                self._font_rt if m.is_rt else self._font_jp,
+                m.x,
+                rt_base_y if m.is_rt else jp_base_y,
+                m.w,
+                m.text,
+                _mora_progress(m, ms),
+            )
+
+        for k in layout.kanjis:
+            draw_unit(self._font_jp, k.x, jp_base_y, k.w, k.text, _kanji_progress(k, ms))
+
+        painter.restore()
+
+        # ZH: centred horizontally, not scaled; y tracks the compressed JP block
+        if has_zh:
+            zh_x = (W - layout.zh_w) / 2
+            zh_y = H / 2.0 * (1.0 - scale) + zh_base_y * scale if scale < 1.0 else zh_base_y
+            if shadow:
+                dx, dy, sc = shadow
+                painter.setFont(self._font_zh)
+                painter.setPen(sc)
+                painter.drawText(QPointF(zh_x + dx, zh_y + dy), layout.zh_text)
+            painter.setFont(self._font_zh)
+            painter.setPen(color_zh_c)
+            painter.drawText(QPointF(zh_x, zh_y), layout.zh_text)
 
 
 # ── Settings dialog ────
@@ -447,8 +524,8 @@ class SettingsDialog(QDialog):
         outer.addWidget(tabs)
 
         # ── Tab: 表示 ──
-        w1   = QWidget()
-        f1   = QFormLayout(w1)
+        w1  = QWidget()
+        f1  = QFormLayout(w1)
         self.font_jp_w    = self._font_row(self.cfg["font_jp"])
         self.font_zh_w    = self._font_row(self.cfg["font_zh"])
         self.font_size_jp = QSpinBox(); self.font_size_jp.setRange(8, 96); self.font_size_jp.setSuffix(" px"); self.font_size_jp.setValue(self.cfg["font_size_jp"])
@@ -462,8 +539,8 @@ class SettingsDialog(QDialog):
         tabs.addTab(w1, "表示")
 
         # ── Tab: 色彩 ──
-        w2   = QWidget()
-        f2   = QFormLayout(w2)
+        w2  = QWidget()
+        f2  = QFormLayout(w2)
         self.btn_sung   = self._color_btn(self.cfg["color_sung"])
         self.btn_unsung = self._color_btn(self.cfg["color_unsung"])
         self.btn_zh     = self._color_btn(self.cfg["color_zh"])
@@ -479,9 +556,9 @@ class SettingsDialog(QDialog):
         tabs.addTab(w2, "色彩")
 
         # ── Tab: 動作 ──
-        w3   = QWidget()
-        f3   = QFormLayout(w3)
-        self.hide_pause = QCheckBox(); self.hide_pause.setChecked(self.cfg["hide_on_pause"])
+        w3  = QWidget()
+        f3  = QFormLayout(w3)
+        self.hide_pause  = QCheckBox(); self.hide_pause.setChecked(self.cfg["hide_on_pause"])
         self.unlock_zone = QSpinBox()
         self.unlock_zone.setRange(20, 200)
         self.unlock_zone.setSuffix(" px")
@@ -536,22 +613,22 @@ class SettingsDialog(QDialog):
     def result_cfg(self) -> dict:
         return {
             **self.cfg,
-            "font_jp":      self.font_jp_w._edit.text(),
-            "font_zh":      self.font_zh_w._edit.text(),
-            "font_size_jp": self.font_size_jp.value(),
-            "font_size_zh": self.font_size_zh.value(),
-            "spacing_zh":   self.spacing_zh.value(),
-            "color_sung":   self.btn_sung._color,
-            "color_unsung": self.btn_unsung._color,
-            "color_zh":     self.btn_zh._color,
-            "opacity":      self.opacity.value(),
+            "font_jp":       self.font_jp_w._edit.text(),
+            "font_zh":       self.font_zh_w._edit.text(),
+            "font_size_jp":  self.font_size_jp.value(),
+            "font_size_zh":  self.font_size_zh.value(),
+            "spacing_zh":    self.spacing_zh.value(),
+            "color_sung":    self.btn_sung._color,
+            "color_unsung":  self.btn_unsung._color,
+            "color_zh":      self.btn_zh._color,
+            "opacity":       self.opacity.value(),
             "hide_on_pause": self.hide_pause.isChecked(),
-            "unlock_zone":  self.unlock_zone.value(),
-            "text_shadow":  self.text_shadow.text(),
+            "unlock_zone":   self.unlock_zone.value(),
+            "text_shadow":   self.text_shadow.text(),
         }
 
 
-# ── Transparent mouse overlay (QWebEngineView swallows OS mouse events) ───
+# ── Transparent mouse overlay ──
 class _MouseOverlay(QWidget):
     def __init__(self, win):
         super().__init__(win)
@@ -585,7 +662,7 @@ class _MouseOverlay(QWidget):
             painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
         if w._zone_preview:
             zone = w._preview_zone_size
-            x0 = self.width() - zone
+            x0   = self.width() - zone
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(255, 200, 0, 50))
             painter.drawRect(x0, 0, zone, zone)
@@ -603,26 +680,55 @@ class _MouseOverlay(QWidget):
     def dropEvent(self, e):         self._win.dropEvent(e)
 
 
-# ── Main window ───
+# ── Screen geometry helpers ──
+
+def _fit_to_screen(x: int, y: int, w: int, h: int) -> Tuple[int, int, int, int]:
+    """Clamp window position so at least KEEP px remain visible on some screen."""
+    screens = QApplication.screens()
+    if not screens:
+        return x, y, w, h
+    screen = next(
+        (s for s in screens if s.geometry().contains(QPoint(x, y))),
+        QApplication.primaryScreen(),
+    )
+    avail = screen.availableGeometry()
+    KEEP  = 80
+    nx = max(avail.x() + KEEP - w, min(x, avail.right()  - KEEP))
+    ny = max(avail.y(),             min(y, avail.bottom() - KEEP))
+    return nx, ny, w, h
+
+
+def _screen_relative_defaults() -> dict:
+    """Return geometry dict sized relative to the primary screen."""
+    screen = QApplication.primaryScreen()
+    if not screen:
+        return {}
+    g = screen.availableGeometry()
+    w = max(480, min(g.width() // 2, 900))
+    h = max(180, g.height() // 5)
+    return dict(x=g.x() + (g.width() - w) // 2, y=g.bottom() - h - 80, w=w, h=h)
+
+
+# ── Main window ──
 class LyricWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.cfg          = load_config()
-        self._locked         = self.cfg["locked"]
-        self._drag_pos       = QPoint()
-        self._is_playing     = False
-        self._page_ready     = False
-        self._pending        = None   # lyrics lines waiting for page load
-        self._last_sec       = 0.0
-        self._last_wall      = time.monotonic()
-        self._fade_anim      = None
-        self._unlock_visible = False  # whether the unlock hot-zone btn is showing
-        self._hovering       = False
-        self._resize_dir     = (0, 0)   # (dx, dy) each -1/0/1
+        self.cfg              = load_config()
+        if not CONFIG_PATH.exists():
+            self.cfg.update(_screen_relative_defaults())
+        self._locked          = self.cfg["locked"]
+        self._drag_pos        = QPoint()
+        self._is_playing      = False
+        self._last_sec        = 0.0
+        self._last_wall       = time.monotonic()
+        self._fade_anim       = None
+        self._unlock_visible  = False
+        self._hovering        = False
+        self._resize_dir      = (0, 0)
         self._resize_start_geo = None
         self._resize_start_pos = None
-        self._zone_preview       = False
-        self._preview_zone_size  = self.cfg.get("unlock_zone", 48)
+        self._zone_preview        = False
+        self._preview_zone_size   = self.cfg.get("unlock_zone", 48)
 
         self._geo_save_timer = QTimer(self)
         self._geo_save_timer.setSingleShot(True)
@@ -631,7 +737,7 @@ class LyricWindow(QWidget):
 
         self._setup_window()
         self._setup_zone_btn()
-        self._setup_web()
+        self._setup_canvas()
         self._setup_smtc()
         self._setup_timer()
         self._setup_cursor_timer()
@@ -639,17 +745,20 @@ class LyricWindow(QWidget):
         if self.cfg["lyrics_path"]:
             self._load_lyrics(self.cfg["lyrics_path"])
 
-    # ── Setup 
+    # ── Setup ──
 
     def _setup_window(self):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool          # no taskbar entry
+            | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowOpacity(self.cfg["opacity"])
-        self.setGeometry(self.cfg["x"], self.cfg["y"], self.cfg["w"], self.cfg["h"])
+        x, y, w, h = _fit_to_screen(
+            self.cfg["x"], self.cfg["y"], self.cfg["w"], self.cfg["h"]
+        )
+        self.setGeometry(x, y, w, h)
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
 
@@ -674,19 +783,19 @@ class LyricWindow(QWidget):
         self._zone_btn.setText("🔓" if self._locked else "🔒")
 
     def _reposition_zone_btn(self):
-        zone = self.cfg.get("unlock_zone", 48)
+        zone   = self.cfg.get("unlock_zone", 48)
         bw, bh = self._zone_btn.width(), self._zone_btn.height()
-        x = self.width() - zone + (zone - bw) // 2
+        x = self.width()  - zone + (zone - bw) // 2
         y = (zone - bh) // 2
         self._zone_btn.move(x, y)
 
     def _set_clickthrough(self, enabled: bool):
         hwnd  = int(self.winId())
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)   # GWL_EXSTYLE
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
         if enabled:
-            style |= 0x00080020   # WS_EX_LAYERED | WS_EX_TRANSPARENT
+            style |=  0x00080020
         else:
-            style &= ~0x00000020  # clear WS_EX_TRANSPARENT; keep WS_EX_LAYERED
+            style &= ~0x00000020
         ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
 
     def _setup_cursor_timer(self):
@@ -706,7 +815,7 @@ class LyricWindow(QWidget):
         if in_zone and not self._unlock_visible:
             self._unlock_visible = True
             if self._locked:
-                self._set_clickthrough(False)   # let button receive the click
+                self._set_clickthrough(False)
             self._zone_btn.raise_()
             self._zone_btn.show()
         elif not in_zone and self._unlock_visible:
@@ -715,24 +824,17 @@ class LyricWindow(QWidget):
             if self._locked:
                 self._set_clickthrough(True)
 
-    def _setup_web(self):
+    def _setup_canvas(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.web = QWebEngineView(self)
-        self.web.page().setBackgroundColor(QColor(0, 0, 0, 0))
-        self.web.settings().setAttribute(QWebEngineSettings.WebAttribute.ShowScrollBars, False)
-        layout.addWidget(self.web)
+        self.canvas = LyricsCanvas(self)
+        self.canvas.apply_cfg(self.cfg)
+        layout.addWidget(self.canvas)
 
-        # Overlay catches all mouse events — QWebEngineView's Chromium renderer
-        # has its own native HWND that consumes OS mouse messages before Qt sees them,
-        # so WA_TransparentForMouseEvents alone is not reliable.
         self._overlay = _MouseOverlay(self)
         self._overlay.setGeometry(0, 0, self.width(), self.height())
-        self._zone_btn.raise_()   # keep zone button above overlay
-
-        self.web.loadFinished.connect(self._on_page_ready)
-        self.web.setHtml(_build_html(self.cfg), QUrl.fromLocalFile(str(Path(__file__).parent) + "/"))
+        self._zone_btn.raise_()
 
     def _setup_smtc(self):
         self.smtc = SMTCWorker()
@@ -741,57 +843,29 @@ class LyricWindow(QWidget):
         self.smtc.start()
 
     def _setup_timer(self):
-        # Re-send current time every 200 ms so JS interpolation stays calibrated
         self._timer = QTimer(self)
         self._timer.setInterval(200)
         self._timer.timeout.connect(self._push_sync)
         self._timer.start()
 
-    # ── Page / lyrics ──
-
-    def _on_page_ready(self):
-        self._page_ready = True
-        self._apply_theme()
-        if self._pending is not None:
-            self._inject(self._pending)
-            self._pending = None
-
-    def _apply_theme(self):
-        self._apply_theme_cfg(self.cfg)
-
-    def _apply_theme_cfg(self, cfg: dict):
-        c = cfg
-        shadow = c.get("text_shadow", "").replace("'", "\\'") or "none"
-        js = (
-            f"setTheme('{c['color_sung']}','{c['color_unsung']}',"
-            f"'{c['color_zh']}','FuriLrcJP','FuriLrcZH',"
-            f"{c['font_size_jp']},{c['font_size_zh']},{c['spacing_zh']},'{shadow}');"
-        )
-        self.web.page().runJavaScript(js)
+    # ── Lyrics loading ──
 
     def _load_lyrics(self, path: str):
         p = Path(path)
         if not p.exists():
             return
         try:
-            raw = json.loads(p.read_text("utf-8"))
+            raw   = json.loads(p.read_text("utf-8"))
             lines = raw.get("lines", raw) if isinstance(raw, dict) else raw
             self.cfg["lyrics_path"] = str(p)
-            if self._page_ready:
-                self._inject(lines)
-            else:
-                self._pending = lines
+            self.canvas.load_lyrics(lines)
         except Exception as e:
             print(f"[furi-lrc] load error: {e}", file=sys.stderr)
 
-    def _inject(self, lines: list):
-        js = f"loadLyrics({json.dumps(lines, ensure_ascii=False)});"
-        self.web.page().runJavaScript(js)
-
-    # ── SMTC callbacks ─
+    # ── SMTC callbacks ──
 
     def _on_time_updated(self, sec: float, playing: bool):
-        was_playing = self._is_playing
+        was_playing      = self._is_playing
         self._last_sec   = sec
         self._last_wall  = time.monotonic()
         self._is_playing = playing
@@ -803,7 +877,7 @@ class LyricWindow(QWidget):
             elif not playing and was_playing:
                 self._fade(show=False)
 
-    def _on_track_changed(self, title: str):
+    def _on_track_changed(self, title: str, _: str):
         if not self.cfg["lyrics_path"]:
             return
         base = Path(self.cfg["lyrics_path"]).parent
@@ -813,16 +887,13 @@ class LyricWindow(QWidget):
                 return
 
     def _push_sync(self):
-        if not self._page_ready:
-            return
         if self._is_playing:
             sec = self._last_sec + (time.monotonic() - self._last_wall)
         else:
             sec = self._last_sec
-        playing_js = "true" if self._is_playing else "false"
-        self.web.page().runJavaScript(f"syncTime({sec:.3f},{playing_js});")
+        self.canvas.sync_time(sec, self._is_playing)
 
-    # ── Animation ─
+    # ── Animation ──
 
     def _fade(self, show: bool):
         if self._fade_anim:
@@ -836,7 +907,7 @@ class LyricWindow(QWidget):
         if show:
             self.show()
 
-    # ── Resize helpers ─
+    # ── Resize helpers ──
 
     _RESIZE_MARGIN = 8
 
@@ -853,24 +924,19 @@ class LyricWindow(QWidget):
             return Qt.CursorShape.SizeHorCursor
         if dx == 0 and dy != 0:
             return Qt.CursorShape.SizeVerCursor
-        # diagonal: dx*dy>0 → \  dx*dy<0 → /
         return Qt.CursorShape.SizeBDiagCursor if dx * dy > 0 else Qt.CursorShape.SizeFDiagCursor
 
     def _do_resize(self, global_pos):
         dx, dy = self._resize_dir
-        geo = self._resize_start_geo
-        ddx = global_pos.x() - self._resize_start_pos.x()
-        ddy = global_pos.y() - self._resize_start_pos.y()
+        geo    = self._resize_start_geo
+        ddx    = global_pos.x() - self._resize_start_pos.x()
+        ddy    = global_pos.y() - self._resize_start_pos.y()
         MIN_W, MIN_H = 200, 100
         nx, ny, nw, nh = geo.x(), geo.y(), geo.width(), geo.height()
-        if dx == -1:
-            nw -= ddx;  nx += ddx
-        elif dx == 1:
-            nw += ddx
-        if dy == -1:
-            nh -= ddy;  ny += ddy
-        elif dy == 1:
-            nh += ddy
+        if dx == -1: nw -= ddx; nx += ddx
+        elif dx ==  1: nw += ddx
+        if dy == -1: nh -= ddy; ny += ddy
+        elif dy ==  1: nh += ddy
         if nw < MIN_W:
             if dx == -1: nx = geo.right() - MIN_W + 1
             nw = MIN_W
@@ -879,19 +945,19 @@ class LyricWindow(QWidget):
             nh = MIN_H
         self.setGeometry(nx, ny, nw, nh)
 
-    # ── Drag / resize (window not locked) ─
+    # ── Drag / resize ──
 
     def mousePressEvent(self, e):
         if self._locked or e.button() != Qt.MouseButton.LeftButton:
             return
         dx, dy = self._get_resize_dir(e.position().toPoint())
         if dx != 0 or dy != 0:
-            self._resize_dir      = (dx, dy)
+            self._resize_dir       = (dx, dy)
             self._resize_start_geo = self.geometry()
             self._resize_start_pos = e.globalPosition().toPoint()
             self._drag_pos = QPoint()
         else:
-            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._drag_pos   = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
             self._resize_dir = (0, 0)
             self._overlay.setCursor(Qt.CursorShape.ClosedHandCursor)
 
@@ -917,7 +983,7 @@ class LyricWindow(QWidget):
             dx, dy = self._get_resize_dir(e.position().toPoint())
             self._overlay.setCursor(self._cursor_for_dir(dx, dy))
 
-    # ── Drag & drop JSON files ───
+    # ── Drag & drop JSON ──
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
@@ -931,29 +997,22 @@ class LyricWindow(QWidget):
                 self._load_lyrics(p)
                 break
 
-    # ── Context menu ───
+    # ── Context menu ──
 
     def contextMenuEvent(self, e):
         menu = QMenu(self)
         if _MENU_FONT:
             menu.setFont(_MENU_FONT)
-
         a = menu.addAction("歌詞を開く…")
         a.triggered.connect(self._open_file)
-
         menu.addSeparator()
-
         a = menu.addAction("ロック解除" if self._locked else "位置をロック")
         a.triggered.connect(self._toggle_lock)
-
         a = menu.addAction("設定…")
         a.triggered.connect(self._show_settings)
-
         menu.addSeparator()
-
         a = menu.addAction("終了")
         a.triggered.connect(QApplication.instance().quit)
-
         menu.exec(e.globalPos())
 
     def _open_file(self):
@@ -968,9 +1027,9 @@ class LyricWindow(QWidget):
                 self._load_lyrics(files[0])
 
     def _toggle_lock(self):
-        self._locked = not self._locked
-        self.cfg["locked"] = self._locked
-        self._unlock_visible = False
+        self._locked          = not self._locked
+        self.cfg["locked"]    = self._locked
+        self._unlock_visible  = False
         self._zone_btn.hide()
         self._update_zone_btn_icon()
         if self._locked:
@@ -990,31 +1049,23 @@ class LyricWindow(QWidget):
 
         def on_preview(preview_cfg: dict):
             self.setWindowOpacity(preview_cfg["opacity"])
-            self._apply_theme_cfg(preview_cfg)
+            self.canvas.apply_cfg(preview_cfg)
             self._preview_zone_size = preview_cfg.get("unlock_zone", 48)
-            self._zone_preview = True
+            self._zone_preview      = True
             self._overlay.update()
-            # reposition zone button live as zone size changes
             self.cfg["unlock_zone"] = self._preview_zone_size
             self._reposition_zone_btn()
 
         dlg = SettingsDialog(self.cfg, self, on_preview=on_preview)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_cfg = dlg.result_cfg()
-            font_changed = (new_cfg["font_jp"] != self.cfg["font_jp"] or
-                            new_cfg["font_zh"] != self.cfg["font_zh"])
-            self.cfg = new_cfg
+            self.cfg = dlg.result_cfg()
             self.setWindowOpacity(self.cfg["opacity"])
-            if font_changed:
-                self._page_ready = False
-                self.web.setHtml(_build_html(self.cfg), QUrl.fromLocalFile(str(Path(__file__).parent) + "/"))   # triggers _on_page_ready
-            else:
-                self._apply_theme()
+            self.canvas.apply_cfg(self.cfg)
             save_config(self.cfg)
         else:
             self.cfg["unlock_zone"] = original_cfg.get("unlock_zone", 48)
             self.setWindowOpacity(original_cfg["opacity"])
-            self._apply_theme_cfg(original_cfg)
+            self.canvas.apply_cfg(original_cfg)
         self._zone_preview = False
         self._reposition_zone_btn()
         self._overlay.update()
@@ -1038,8 +1089,6 @@ class LyricWindow(QWidget):
         self.cfg.update(x=self.x(), y=self.y(), w=self.width(), h=self.height())
         save_config(self.cfg)
 
-    # ── Persist on close ────
-
     def closeEvent(self, e):
         self.cfg.update(x=self.x(), y=self.y(), w=self.width(), h=self.height(), locked=self._locked)
         save_config(self.cfg)
@@ -1047,33 +1096,26 @@ class LyricWindow(QWidget):
         super().closeEvent(e)
 
 
-# ── Entry ────
+# ── Entry ──
 _MENU_FONT: QFont | None = None
 
 
 def _load_menu_font() -> None:
     global _MENU_FONT
-    path = str(FONTS_DIR / "NotoSansJP-Regular.ttf")
-    fid  = QFontDatabase.addApplicationFont(path)
+    path     = str(FONTS_DIR / "NotoSansJP-Regular.ttf")
+    fid      = QFontDatabase.addApplicationFont(path)
     families = QFontDatabase.applicationFontFamilies(fid)
     if families:
         _MENU_FONT = QFont(families[0])
 
 
 def main():
-    # Must be set before QApplication for WebEngine transparency to work on Windows
-    import os
-    # --disable-gpu-compositing was previously used to prevent transparent-overlay flicker,
-    # but it forces software compositing which causes all CSS animations to stutter.
-    # This app does not use backdrop-filter:blur (the usual trigger), so GPU compositing
-    # can stay on.  If the transparent background breaks, set this env var manually before
-    # launching: QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu-compositing
-    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--enable-gpu-rasterization")
-
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     app = QApplication(sys.argv)
     app.setApplicationName("furi-lrc")
     _load_menu_font()
-
     win = LyricWindow()
     win.show()
     sys.exit(app.exec())

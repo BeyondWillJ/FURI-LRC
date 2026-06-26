@@ -179,7 +179,38 @@ html, body {
   transition: opacity 0.35s ease;
 }
 .line.active { opacity: 1; }
-.jp { font-family: var(--font-jp); font-size: var(--fsize-jp); font-weight: 600; }
+
+/* The glyph run is wrapped in an inline-block so it shrinks to the text width
+   and stays horizontally centered.  The two .jp layers stack pixel-perfectly
+   inside it: .base (gray, in flow, defines the box and is measured) and
+   .fill (highlight, absolutely positioned on top, revealed by a clip mask). */
+.jp-wrap {
+  position: relative;
+  display: inline-block;
+  text-align: left;
+  white-space: nowrap;   /* one visual line → the horizontal sweep is exact */
+  max-width: 100%;
+}
+.jp {
+  font-family: var(--font-jp);
+  font-size: var(--fsize-jp);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.jp.base {
+  color: var(--unsung);
+  text-shadow: var(--text-shadow);
+  transform: translateZ(0);   /* cache as a texture: the blurred shadow rasters once, not per frame */
+}
+.jp.fill {
+  position: absolute;
+  left: 0; top: 0;
+  color: var(--sung);
+  clip-path: inset(0 100% 0 0);   /* nothing shown until the rAF loop drives it */
+  will-change: clip-path;
+  pointer-events: none;
+}
+
 .zh {
   font-family: var(--font-zh);
   font-size: var(--fsize-zh);
@@ -189,23 +220,9 @@ html, body {
   margin-top: var(--spacing-zh);
   padding-bottom: 0.25em;
 }
-ruby { ruby-align: center; display: ruby; }
-rt   { font-size: 0.5em; display: ruby-text; ruby-align: center; }
-/* Karaoke sweep: per-frame JS writes --p (0→1); gradient reveals the sung color */
-.unit {
-  display: inline-block;
-  background: linear-gradient(
-    90deg,
-    var(--sung)   0%,
-    var(--sung)   calc(var(--p, 0) * 100%),
-    var(--unsung) calc(var(--p, 0) * 100%),
-    var(--unsung) 100%
-  );
-  -webkit-background-clip: text;
-          background-clip: text;
-  color: transparent;
-}
-ruby > span.unit { display: inline; }    /* base kanji must stay inline for ruby layout */
+ruby { ruby-align: center; }
+rt   { font-size: 0.5em; ruby-align: center; }
+
 #placeholder {
   position: absolute;
   left: 0; right: 0;
@@ -217,36 +234,71 @@ ruby > span.unit { display: inline; }    /* base kanji must stay inline for ruby
   text-align: center;
   opacity: 0.4;
 }
+#hud {
+  position: fixed;
+  left: 4px; top: 2px;
+  font: 11px/1.4 monospace;
+  color: #0f0;
+  text-shadow: 0 0 2px #000, 0 0 2px #000;
+  white-space: pre;
+  pointer-events: none;
+  display: none;
+}
+#hud.on { display: block; }
 </style>
 </head>
 <body>
 <div id="wrap">
   <div id="placeholder">歌詞ファイルをドロップまたは右クリックで開く</div>
 </div>
+<div id="hud"></div>
 <script>
 "use strict";
 
-let lyrics  = [];
-let syncSec = 0, syncWall = 0, playing = false;
-let activeI = -1;
-/* _cache[li] = flat array of {el, u, rubyUnits}
-   u          → plain kana / furigana mora  (set --p from u.s/u.e)
-   rubyUnits  → ruby base kanji             (set --p = avg of its mora progress) */
-let _cache  = [];
+let lyrics   = [];
+let lineSegs = [];     // per line: flat, ordered list of timed+measurable units
+let lineGeo  = [];     // per line: cached pixel geometry (lazy, invalidated on resize/font change)
+let baseMs   = 0;      // playback position (ms) anchored at baseWall
+let baseWall = 0;      // performance.now() when baseMs was anchored
+let playing  = false;
+let activeI  = -1;
+let _dbg     = false;  // furiDebug(true) to show an fps/clock HUD
 
-/* ── Public API ── */
+/* ── Public API (unchanged signatures — Python side needs no edits) ── */
 
 function loadLyrics(data) {
-  lyrics  = data;
+  lyrics  = data || [];
   activeI = -1;
-  _cache  = [];
+  lineGeo = [];
   buildDOM();
 }
 
 function syncTime(sec, isPlaying) {
-  syncSec  = sec;
-  syncWall = performance.now();
-  playing  = isPlaying;
+  /* The external SMTC position is coarse and arrives ~5x/sec; snapping the
+     clock to it every time makes the sweep jitter.  Instead the clock runs
+     free at real wall-clock speed and only absorbs a fraction of the error
+     each update — so it stays locked without ever visibly jumping.  A large
+     error (seek) or a play/resume still hard-resyncs. */
+  const target    = sec * 1000;
+  const predicted = playing ? (baseMs + (performance.now() - baseWall)) : baseMs;
+
+  if (!isPlaying) {
+    playing  = false;
+    baseMs   = target;
+    baseWall = performance.now();
+    return;
+  }
+
+  const wasPlaying = playing;
+  playing = true;
+  const err = target - predicted;
+
+  if (!wasPlaying || Math.abs(err) > 700) {
+    baseMs   = target;                  // resume or seek → hard resync
+  } else {
+    baseMs   = predicted + err * 0.15;  // small drift → ease 15% toward truth
+  }
+  baseWall = performance.now();
 }
 
 function setTheme(sung, unsung, zh, fontJP, fontZH, fsizeJP, fsizeZH, spacingZH, shadow) {
@@ -260,18 +312,34 @@ function setTheme(sung, unsung, zh, fontJP, fontZH, fsizeJP, fsizeZH, spacingZH,
   r.setProperty('--fsize-zh',    fsizeZH + 'px');
   r.setProperty('--spacing-zh',  spacingZH + 'px');
   r.setProperty('--text-shadow', shadow || 'none');
+  lineGeo = [];   // font size changed → glyph widths changed → re-measure
 }
 
-/* ── DOM builder (also populates element cache) ── */
+/* ── DOM builder: two identical layers per line + a flat timing list ── */
 
 function buildDOM() {
   const wrap = document.getElementById('wrap');
   wrap.innerHTML = '';
+  lineSegs = [];
+
   lyrics.forEach((line, li) => {
     const d = document.createElement('div');
     d.className = 'line';
     d.id = 'L' + li;
-    buildJP(d, li, line.jp);
+
+    const jw = document.createElement('div');
+    jw.className = 'jp-wrap';
+    jw.id = 'W' + li;
+
+    const base = buildJP(li, line.jp, true);    // measured, unsung
+    const fill = buildJP(li, line.jp, false);   // highlight, clipped
+    base.classList.add('base');
+    fill.classList.add('fill');
+    fill.id = 'F' + li;
+    jw.appendChild(base);
+    jw.appendChild(fill);
+    d.appendChild(jw);
+
     if (line.zh) {
       const zh = document.createElement('div');
       zh.className = 'zh';
@@ -279,57 +347,109 @@ function buildDOM() {
       d.appendChild(zh);
     }
     wrap.appendChild(d);
+
+    /* Flat, reading-order list of the units we can both time and measure.
+       A ruby segment is treated as ONE geometry box (the base kanji) spanning
+       the time range of all its furigana morae, so the kanji fills smoothly. */
+    const flat = [];
+    line.jp.forEach((seg, si) => {
+      if (seg.ruby) {
+        if (seg.units.length) {
+          flat.push({
+            id: 'B' + li + '_' + si,
+            s:  seg.units[0].s,
+            e:  seg.units[seg.units.length - 1].e,
+          });
+        }
+      } else {
+        seg.units.forEach((u, ui) => {
+          flat.push({ id: 'U' + li + '_' + si + '_' + ui, s: u.s, e: u.e });
+        });
+      }
+    });
+    lineSegs[li] = flat;
+
+    if (flat.some(f => typeof f.s !== 'number' || typeof f.e !== 'number')) {
+      console.warn('[furi-lrc] line ' + li + ' has morae missing numeric s/e — no sweep possible for it.');
+    }
   });
 }
 
-function buildJP(parent, li, segs) {
-  const jp    = document.createElement('div');
+function buildJP(li, segs, isBase) {
+  const jp = document.createElement('div');
   jp.className = 'jp';
-  const lineCache = [];
-  segs.forEach((seg) => {
+  segs.forEach((seg, si) => {
     if (seg.ruby) {
       const ruby = document.createElement('ruby');
-      /* Base kanji span — progress = average of its mora progress */
-      const base = document.createElement('span');
-      base.className = 'unit';
-      base.style.setProperty('--p', '0');
-      base.textContent = seg.base;
-      ruby.appendChild(base);
-      lineCache.push({ el: base, u: null, rubyUnits: seg.units });
-      /* Furigana mora spans — each has its own timing */
+      const b = document.createElement('span');
+      b.className = 'unit';
+      if (isBase) b.id = 'B' + li + '_' + si;   // only the base layer is measured
+      b.textContent = seg.base;
+      ruby.appendChild(b);
       const rt = document.createElement('rt');
       seg.units.forEach((u) => {
         const s = document.createElement('span');
-        s.className = 'unit';
-        s.style.setProperty('--p', '0');
         s.textContent = u.k;
         rt.appendChild(s);
-        lineCache.push({ el: s, u: u, rubyUnits: null });
       });
       ruby.appendChild(rt);
       jp.appendChild(ruby);
     } else {
-      seg.units.forEach((u) => {
+      seg.units.forEach((u, ui) => {
         const s = document.createElement('span');
         s.className = 'unit';
-        s.style.setProperty('--p', '0');
+        if (isBase) s.id = 'U' + li + '_' + si + '_' + ui;
         s.textContent = u.k;
         jp.appendChild(s);
-        lineCache.push({ el: s, u: u, rubyUnits: null });
       });
     }
   });
-  _cache[li] = lineCache;
-  parent.appendChild(jp);
+  return jp;
 }
 
-/* ── Per-frame karaoke sweep ── */
+/* ── Pixel geometry (measured once per line, cached) ── */
 
-function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+function measureLine(li) {
+  const wrap = document.getElementById('W' + li);
+  const flat = lineSegs[li] || [];
+  const items = [];
+  for (const seg of flat) {
+    const el = document.getElementById(seg.id);
+    if (!el) continue;
+    items.push({ s: seg.s, e: seg.e, left: el.offsetLeft, width: el.offsetWidth });
+  }
+  return { items, totalW: wrap ? wrap.clientWidth : 0 };
+}
+
+function geoFor(li) {
+  if (!lineGeo[li]) lineGeo[li] = measureLine(li);
+  return lineGeo[li];
+}
+
+/* Map playback time → x pixel of the highlight edge.
+   Within a unit the edge interpolates linearly in time across that glyph's
+   width; between units it rests at the right edge of the last sung glyph. */
+function sweepX(geo, t) {
+  const it = geo.items;
+  if (!it.length) return 0;
+  if (t <= it[0].s) return 0;
+  const last = it[it.length - 1];
+  if (t >= last.e) return geo.totalW;
+  for (let k = 0; k < it.length; k++) {
+    const seg = it[k];
+    if (t < seg.s) return k > 0 ? (it[k - 1].left + it[k - 1].width) : 0;
+    if (t < seg.e) {
+      const f = (t - seg.s) / Math.max(1, seg.e - seg.s);
+      return seg.left + f * seg.width;
+    }
+  }
+  return geo.totalW;
+}
+
+/* ── Clock ── */
 
 function nowMs() {
-  const drift = playing ? (performance.now() - syncWall) : 0;
-  return syncSec * 1000 + drift;
+  return playing ? (baseMs + (performance.now() - baseWall)) : baseMs;
 }
 
 function findLine(ms) {
@@ -340,32 +460,27 @@ function findLine(ms) {
   return idx;
 }
 
-function updateLine(li, ms) {
-  const lineCache = _cache[li];
-  if (!lineCache) return;
-  for (const entry of lineCache) {
-    let p;
-    if (entry.rubyUnits !== null) {
-      /* Ruby base kanji: fill in proportion to how many of its morae have been sung */
-      let sum = 0;
-      for (const u of entry.rubyUnits) {
-        sum += clamp01((ms - u.s) / Math.max(1, u.e - u.s));
-      }
-      p = clamp01(sum / entry.rubyUnits.length);
-    } else {
-      const u = entry.u;
-      p = clamp01((ms - u.s) / Math.max(1, u.e - u.s));
-    }
-    entry.el.style.setProperty('--p', p);
-  }
+/* ── rAF loop: pick the active line, then drive its clip mask every frame ── */
+
+let _fpsT = 0, _fpsN = 0, _fps = 0, _lastFrame = 0, _worstGap = 0;
+
+function furiDebug(on) {
+  _dbg = !!on;
+  document.getElementById('hud').classList.toggle('on', _dbg);
 }
 
-function sweep() {
+function sweep(ts) {
+  if (_dbg) {
+    if (_lastFrame) _worstGap = Math.max(_worstGap, ts - _lastFrame);
+    _lastFrame = ts;
+    _fpsN++;
+    if (ts - _fpsT >= 500) { _fps = Math.round(_fpsN * 1000 / (ts - _fpsT)); _fpsT = ts; _fpsN = 0; }
+  }
+
   if (lyrics.length > 0) {
     const ms = nowMs();
     const li = findLine(ms);
 
-    /* Line-level fade in/out */
     if (li !== activeI) {
       if (activeI >= 0) {
         const prev = document.getElementById('L' + activeI);
@@ -378,10 +493,31 @@ function sweep() {
       activeI = li;
     }
 
-    /* Per-glyph karaoke sweep — runs every frame */
-    if (li >= 0) updateLine(li, ms);
+    if (li >= 0) {
+      const fill = document.getElementById('F' + li);
+      if (fill) {
+        const geo = geoFor(li);
+        const x   = sweepX(geo, ms);
+        const r   = Math.max(0, geo.totalW - x);
+        fill.style.clipPath = 'inset(0 ' + r.toFixed(1) + 'px 0 0)';
+      }
+    }
+
+    if (_dbg) {
+      document.getElementById('hud').textContent =
+        'fps ' + _fps + '  worstGap ' + _worstGap.toFixed(0) + 'ms\n' +
+        'clk ' + (ms / 1000).toFixed(2) + 's  line ' + activeI + '  play ' + playing;
+      _worstGap = 0;
+    }
   }
   requestAnimationFrame(sweep);
+}
+
+/* Cached pixel widths are only valid for the current layout/font, so drop the
+   cache when either changes; the next frame re-measures lazily. */
+window.addEventListener('resize', () => { lineGeo = []; });
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(() => { lineGeo = []; });
 }
 
 requestAnimationFrame(sweep);
@@ -1063,12 +1199,23 @@ def _load_menu_font() -> None:
 def main():
     # Must be set before QApplication for WebEngine transparency to work on Windows
     import os
-    # --disable-gpu-compositing was previously used to prevent transparent-overlay flicker,
-    # but it forces software compositing which causes all CSS animations to stutter.
-    # This app does not use backdrop-filter:blur (the usual trigger), so GPU compositing
-    # can stay on.  If the transparent background breaks, set this env var manually before
-    # launching: QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu-compositing
-    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--enable-gpu-rasterization")
+    # The real smoothness killer for a transparent, always-on-top tool window is
+    # Chromium's *throttling*, not the sweep code: Windows native-occlusion
+    # detection can flag the overlay as covered and slow/halt its renderer, and
+    # the renderer-backgrounding heuristics do the same when it has no focus.
+    # That caps rAF to a crawl → visible stutter no matter how cheap the frame is.
+    # Disabling those three lets the overlay paint at a steady vsync rate.
+    #
+    # GPU rasterization stays on (software compositing makes every animation
+    # stutter). If the transparent background ever breaks on your GPU, append
+    # --disable-gpu-compositing to the env var below before launching.
+    os.environ.setdefault(
+        "QTWEBENGINE_CHROMIUM_FLAGS",
+        "--enable-gpu-rasterization "
+        "--disable-features=CalculateNativeWinOcclusion "
+        "--disable-backgrounding-occluded-windows "
+        "--disable-renderer-backgrounding"
+    )
 
     app = QApplication(sys.argv)
     app.setApplicationName("furi-lrc")
