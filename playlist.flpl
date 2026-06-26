@@ -6,9 +6,5 @@
     }
   ],
   "current": 0,
-  "loop_mode": 2,
-  "position_ms": 39733,
-  "volume": 0.32432432432432434,
-  "playing": false,
-  "shuffle_history": []
+  "loop_mode": 1
 }

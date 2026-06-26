@@ -1,0 +1,11 @@
+# 核心依赖
+PyQt6
+PyQt6-WebEngine
+
+# Windows 媒体控制
+winsdk
+
+# 波形显示
+numpy
+librosa
+soundfile

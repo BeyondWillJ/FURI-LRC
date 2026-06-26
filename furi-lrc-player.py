@@ -30,7 +30,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QColor, QCursor, QPainter, QPen, QFont, QFontDatabase,
     QPixmap, QLinearGradient, QBrush, QAction, QKeySequence, QShortcut,
-    QDragEnterEvent, QDropEvent,
+    QDragEnterEvent, QDropEvent, QIcon, QPolygonF,
 )
 
 try:
@@ -125,12 +125,13 @@ def _ms_fmt(ms: int) -> str:
 
 @dataclasses.dataclass
 class Track:
-    path:     str
-    title:    str = ""
-    artist:   str = ""
-    album:    str = ""
-    dur_ms:   int = 0      # filled by QMediaPlayer on first play
-    art_data: bytes = dataclasses.field(default_factory=bytes, repr=False)
+    path:        str
+    title:       str = ""
+    artist:      str = ""
+    album:       str = ""
+    dur_ms:      int = 0      # filled by QMediaPlayer on first play
+    art_data:    bytes = dataclasses.field(default_factory=bytes, repr=False)
+    lyrics_path: str = ""     # manually assigned JSON lyrics
 
     def display_title(self) -> str:
         return self.title or Path(self.path).stem
@@ -168,6 +169,105 @@ def _build_track(path: str) -> Track:
     return Track(path=path, title=title, artist=artist, album=album, art_data=art)
 
 
+def _lock_icon(locked: bool) -> QIcon:
+    px = QPixmap(24, 24)
+    px.fill(QColor(0, 0, 0, 0))
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("white"), 2)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRoundedRect(6, 10, 12, 9, 2, 2)
+    if locked:
+        p.drawArc(8, 4, 8, 10, 0, 180 * 16)
+    else:
+        p.drawArc(11, 4, 8, 10, 35 * 16, 180 * 16)
+    p.end()
+    return QIcon(px)
+
+
+def _player_icon(kind: str, color: str = _TEXT) -> QIcon:
+    px = QPixmap(24, 24)
+    px.fill(QColor(0, 0, 0, 0))
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    c = QColor(color)
+    pen = QPen(c, 2.2)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(c)
+
+    def tri(points):
+        p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in points]))
+
+    def arrow_head(x, y, left=True):
+        if left:
+            tri([(x, y), (x + 4, y - 3), (x + 4, y + 3)])
+        else:
+            tri([(x, y), (x - 4, y - 3), (x - 4, y + 3)])
+
+    if kind == "play":
+        tri([(8, 5), (8, 19), (18, 12)])
+    elif kind == "pause":
+        p.drawRoundedRect(QRectF(7, 5, 3.5, 14), 1, 1)
+        p.drawRoundedRect(QRectF(13.5, 5, 3.5, 14), 1, 1)
+    elif kind == "stop":
+        p.drawRoundedRect(QRectF(7, 7, 10, 10), 1.5, 1.5)
+    elif kind == "prev":
+        p.drawLine(6, 6, 6, 18)
+        tri([(8, 12), (14, 6), (14, 18)])
+        tri([(14, 12), (20, 6), (20, 18)])
+    elif kind == "next":
+        p.drawLine(18, 6, 18, 18)
+        tri([(16, 12), (10, 6), (10, 18)])
+        tri([(10, 12), (4, 6), (4, 18)])
+    elif kind == "seek_back":
+        tri([(8, 12), (14, 7), (14, 17)])
+        tri([(14, 12), (20, 7), (20, 17)])
+    elif kind == "seek_forward":
+        tri([(16, 12), (10, 7), (10, 17)])
+        tri([(10, 12), (4, 7), (4, 17)])
+    elif kind == "volume":
+        tri([(4, 10), (8, 10), (13, 6), (13, 18), (8, 14), (4, 14)])
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(14, 8, 5, 8, -45 * 16, 90 * 16)
+        p.drawArc(16, 6, 7, 12, -45 * 16, 90 * 16)
+    elif kind == "loop_seq":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(5, 12, 18, 12)
+        arrow_head(19, 12, left=False)
+    elif kind == "loop_all":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(5, 6, 14, 9, 20 * 16, 210 * 16)
+        p.drawArc(5, 9, 14, 9, 200 * 16, 210 * 16)
+        arrow_head(18, 7, left=False)
+        arrow_head(6, 17, left=True)
+    elif kind == "loop_one":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(5, 6, 14, 9, 20 * 16, 210 * 16)
+        p.drawArc(5, 9, 14, 9, 200 * 16, 210 * 16)
+        arrow_head(18, 7, left=False)
+        arrow_head(6, 17, left=True)
+        p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        p.drawText(QRectF(9, 8, 6, 8), Qt.AlignmentFlag.AlignCenter, "1")
+    elif kind == "shuffle":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(5, 8, 9, 8)
+        p.drawLine(9, 8, 15, 16)
+        p.drawLine(15, 16, 18, 16)
+        arrow_head(19, 16, left=False)
+        p.drawLine(5, 16, 9, 16)
+        p.drawLine(9, 16, 15, 8)
+        p.drawLine(15, 8, 18, 8)
+        arrow_head(19, 8, left=False)
+
+    p.end()
+    return QIcon(px)
+
+
 # ── Loop mode ────────────────────────────────────────────────────────────────
 class LoopMode(enum.IntEnum):
     SEQUENTIAL = 0
@@ -176,7 +276,7 @@ class LoopMode(enum.IntEnum):
     SHUFFLE    = 3
 
 
-_LOOP_ICONS  = ["➡", "🔁", "🔂", "🔀"]
+_LOOP_ICON_NAMES = ["loop_seq", "loop_all", "loop_one", "shuffle"]
 _LOOP_TIPS   = ["順番再生", "全曲ループ", "1曲ループ", "シャッフル"]
 
 
@@ -404,12 +504,13 @@ class NowPlayingPanel(QWidget):
 
 # ── Playlist panel ────────────────────────────────────────────────────────────
 class PlaylistPanel(QWidget):
-    play_index = pyqtSignal(int)
-    add_files  = pyqtSignal(list)     # list[str]
-    remove_sel = pyqtSignal()
-    clear_all  = pyqtSignal()
-    save_req   = pyqtSignal()
-    load_req   = pyqtSignal()
+    play_index    = pyqtSignal(int)
+    add_files     = pyqtSignal(list)   # list[str]
+    remove_sel    = pyqtSignal()
+    clear_all     = pyqtSignal()
+    save_req      = pyqtSignal()
+    load_req      = pyqtSignal()
+    assign_lyrics = pyqtSignal(int)    # row index
 
     def __init__(self):
         super().__init__()
@@ -433,7 +534,7 @@ class PlaylistPanel(QWidget):
 
         btn_save = QPushButton("保存")
         btn_save.setFixedWidth(44)
-        btn_save.setToolTip("プレイリストを保存 (.flpl)")
+        btn_save.setToolTip("プレイリストを保存 (Ctrl+S)")
         btn_save.clicked.connect(self.save_req)
         hdr.addWidget(btn_save)
 
@@ -478,11 +579,13 @@ class PlaylistPanel(QWidget):
             self.add_files.emit(paths)
 
     def _ctx_menu(self, pos):
+        row = self._list.currentRow()
         menu = QMenu(self)
         a1 = menu.addAction("再生")
-        a1.triggered.connect(lambda: (
-            self.play_index.emit(self._list.currentRow())
-        ))
+        a1.triggered.connect(lambda: self.play_index.emit(row))
+        menu.addSeparator()
+        a3 = menu.addAction("歌詞を指定…")
+        a3.triggered.connect(lambda: self.assign_lyrics.emit(row))
         menu.addSeparator()
         a2 = menu.addAction("削除")
         a2.triggered.connect(self.remove_sel)
@@ -557,29 +660,43 @@ class ControlBar(QWidget):
         # Transport row
         trans = QHBoxLayout()
         trans.setSpacing(6)
+        self._icon_play = _player_icon("play")
+        self._icon_pause = _player_icon("pause")
+        self._loop_icons = [_player_icon(name) for name in _LOOP_ICON_NAMES]
 
-        def _btn(text, tip, fn, checkable=False, w=36):
+        def _btn(text, tip, fn, checkable=False, w=36, icon=None):
             b = QPushButton(text)
             b.setToolTip(tip)
             b.setFixedSize(w, 32)
+            b.setIconSize(QSize(18, 18))
+            if icon is not None:
+                b.setIcon(icon)
             b.setCheckable(checkable)
             b.clicked.connect(fn)
             trans.addWidget(b)
             return b
 
-        _btn("⏮", "前の曲 (Ctrl+←)", self.prev_track)
-        _btn("⏪", "-5秒",  lambda: self.seek_rel.emit(-5000))
-        self._btn_play = _btn("▶", "再生/一時停止 (Space)", self.play_pause, w=48)
-        _btn("⏩", "+5秒",  lambda: self.seek_rel.emit(5000))
-        _btn("⏭", "次の曲 (Ctrl+→)", self.next_track)
-        _btn("⏹", "停止", self.stop)
+        _btn("", "前の曲 (Ctrl+←)", self.prev_track,
+             icon=_player_icon("prev"))
+        _btn("", "-5秒", lambda: self.seek_rel.emit(-5000),
+             icon=_player_icon("seek_back"))
+        self._btn_play = _btn("", "再生/一時停止 (Space)", self.play_pause, w=48,
+                              icon=self._icon_play)
+        _btn("", "+5秒", lambda: self.seek_rel.emit(5000),
+             icon=_player_icon("seek_forward"))
+        _btn("", "次の曲 (Ctrl+→)", self.next_track,
+             icon=_player_icon("next"))
+        _btn("", "停止", self.stop,
+             icon=_player_icon("stop"))
 
         trans.addSpacing(16)
 
         # Loop mode button (cycles through modes)
         self._loop_mode = LoopMode.LOOP_ALL
-        self._btn_loop = QPushButton(_LOOP_ICONS[self._loop_mode])
+        self._btn_loop = QPushButton("")
         self._btn_loop.setFixedSize(36, 32)
+        self._btn_loop.setIconSize(QSize(18, 18))
+        self._btn_loop.setIcon(self._loop_icons[self._loop_mode])
         self._btn_loop.setToolTip(_LOOP_TIPS[self._loop_mode])
         self._btn_loop.clicked.connect(self._cycle_loop)
         trans.addWidget(self._btn_loop)
@@ -587,9 +704,12 @@ class ControlBar(QWidget):
         trans.addSpacing(8)
 
         # Volume
-        vol_icon = QLabel("🔊")
-        vol_icon.setStyleSheet("font-size: 16px;")
-        trans.addWidget(vol_icon)
+        vol_btn = QPushButton("")
+        vol_btn.setFixedSize(28, 32)
+        vol_btn.setIconSize(QSize(18, 18))
+        vol_btn.setIcon(_player_icon("volume"))
+        vol_btn.setToolTip("音量")
+        trans.addWidget(vol_btn)
         self._vol = VolumeBar()
         self._vol.changed.connect(self.vol_changed)
         trans.addWidget(self._vol)
@@ -600,17 +720,17 @@ class ControlBar(QWidget):
 
     def _cycle_loop(self):
         self._loop_mode = LoopMode((int(self._loop_mode) + 1) % len(LoopMode))
-        self._btn_loop.setText(_LOOP_ICONS[self._loop_mode])
+        self._btn_loop.setIcon(self._loop_icons[self._loop_mode])
         self._btn_loop.setToolTip(_LOOP_TIPS[self._loop_mode])
         self.loop_changed.emit(int(self._loop_mode))
 
     def set_loop_mode(self, mode: LoopMode):
         self._loop_mode = mode
-        self._btn_loop.setText(_LOOP_ICONS[mode])
+        self._btn_loop.setIcon(self._loop_icons[mode])
         self._btn_loop.setToolTip(_LOOP_TIPS[mode])
 
     def set_playing(self, playing: bool):
-        self._btn_play.setText("⏸" if playing else "▶")
+        self._btn_play.setIcon(self._icon_pause if playing else self._icon_play)
         self._btn_play.setToolTip("一時停止 (Space)" if playing else "再生 (Space)")
 
     def set_position(self, ms: int, dur: int):
@@ -623,8 +743,55 @@ class ControlBar(QWidget):
         self._seekbar.set_duration(ms)
         self._time_tot.setText(_ms_fmt(ms))
 
+    def set_volume(self, v: float):
+        self._vol.set_volume(v)
+
     def get_loop_mode(self) -> LoopMode:
         return self._loop_mode
+
+
+# ── Transparent mouse-capture layer for LyricOverlay ─────────────────────────
+class _OverlayMousePane(QWidget):
+    """Full-size transparent child that sits above LyricsCanvas and routes
+    all mouse/context/drag events back to LyricOverlay."""
+
+    def __init__(self, parent: "LyricOverlay"):
+        super().__init__(parent)
+        self._win = parent
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.setAcceptDrops(True)
+
+    def enterEvent(self, e):
+        if not self._win._locked:
+            self._win._hovering = True
+            self._win.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._win._hovering = False
+        self._win.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _):
+        w = self._win
+        p = QPainter(self)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 1))
+        p.drawRect(self.rect())
+        if not (w._hovering and not w._locked):
+            return
+        pen = QPen(QColor(255, 255, 255, 38))
+        pen.setWidth(1)
+        p.setPen(pen)
+        p.drawRect(0, 0, self.width() - 1, self.height() - 1)
+
+    def mousePressEvent(self, e):   self._win.mousePressEvent(e)
+    def mouseMoveEvent(self, e):    self._win.mouseMoveEvent(e)
+    def mouseReleaseEvent(self, e): self._win.mouseReleaseEvent(e)
+    def contextMenuEvent(self, e):  self._win.contextMenuEvent(e)
+    def dragEnterEvent(self, e):    self._win.dragEnterEvent(e)
+    def dropEvent(self, e):         self._win.dropEvent(e)
 
 
 # ── Lyrics overlay (overlay driven from player, no SMTC) ─────────────────────
@@ -649,6 +816,11 @@ class LyricOverlay(QWidget):
         cfg = _OV.load_config()
         self.cfg = cfg
 
+        self._state_save_timer = QTimer(self)
+        self._state_save_timer.setSingleShot(True)
+        self._state_save_timer.setInterval(600)
+        self._state_save_timer.timeout.connect(self.save_geometry)
+
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -667,11 +839,32 @@ class LyricOverlay(QWidget):
         self.canvas.apply_cfg(cfg)
         lay.addWidget(self.canvas)
 
+        # Transparent pane above canvas — captures mouse/drag, draws hover border
+        self._mouse_pane = _OverlayMousePane(self)
+        self._mouse_pane.setGeometry(0, 0, self.width(), self.height())
+
         if cfg.get("lyrics_path"):
             self._load_lyrics(cfg["lyrics_path"])
 
         x, y, w, h = _OV._fit_to_screen(cfg["x"], cfg["y"], cfg["w"], cfg["h"])
         self.setGeometry(x, y, w, h)
+
+        # Lock / unlock button (shown when cursor enters the unlock zone)
+        self._zone_btn = QPushButton(self)
+        self._zone_btn.setFixedSize(30, 30)
+        self._zone_btn.setStyleSheet(
+            "QPushButton{"
+            "  background:rgba(0,0,0,150); color:white; border:none;"
+            "  border-radius:6px; font-size:15px;"
+            "}"
+            "QPushButton:hover{ background:rgba(60,60,60,200); }"
+        )
+        self._zone_btn.clicked.connect(self._toggle_lock)
+        self._zone_btn.setIconSize(QSize(20, 20))
+        self._zone_btn.hide()
+        self._zone_btn.raise_()
+        self._update_zone_btn_icon()
+        self._reposition_zone_btn()
 
         # Lock-zone cursor timer
         self._cursor_timer = QTimer(self)
@@ -692,6 +885,7 @@ class LyricOverlay(QWidget):
             lines = raw.get("lines", raw) if isinstance(raw, dict) else raw
             self.cfg["lyrics_path"] = str(p)
             self.canvas.load_lyrics(lines)
+            self._queue_state_save()
         except Exception as e:
             print(f"[overlay] lyrics load error: {e}", file=sys.stderr)
 
@@ -728,6 +922,18 @@ class LyricOverlay(QWidget):
             style &= ~0x00000020
         ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
 
+    def _update_zone_btn_icon(self):
+        self._zone_btn.setText("")
+        self._zone_btn.setIcon(_lock_icon(self._locked))
+        self._zone_btn.setToolTip("ロック解除" if self._locked else "位置をロック")
+
+    def _reposition_zone_btn(self):
+        zone   = self.cfg.get("unlock_zone", 48)
+        bw, bh = self._zone_btn.width(), self._zone_btn.height()
+        x = self.width()  - zone + (zone - bw) // 2
+        y = (zone - bh) // 2
+        self._zone_btn.move(x, y)
+
     def _check_unlock_zone(self):
         geo    = self.geometry()
         cursor = QCursor.pos()
@@ -740,10 +946,27 @@ class LyricOverlay(QWidget):
             self._unlock_visible = True
             if self._locked:
                 self._set_clickthrough(False)
+            self._zone_btn.raise_()
+            self._zone_btn.show()
         elif not in_zone and self._unlock_visible:
             self._unlock_visible = False
+            self._zone_btn.hide()
             if self._locked:
                 self._set_clickthrough(True)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, "_mouse_pane"):
+            self._mouse_pane.setGeometry(0, 0, self.width(), self.height())
+            self._mouse_pane.raise_()
+        if hasattr(self, "_zone_btn"):
+            self._reposition_zone_btn()
+            self._zone_btn.raise_()
+        self._queue_state_save()
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        self._queue_state_save()
 
     _RESIZE_M = 8
 
@@ -759,6 +982,11 @@ class LyricOverlay(QWidget):
         if dx == 0 and dy != 0: return Qt.CursorShape.SizeVerCursor
         return Qt.CursorShape.SizeBDiagCursor if dx * dy > 0 else Qt.CursorShape.SizeFDiagCursor
 
+    def _set_overlay_cursor(self, cursor):
+        if hasattr(self, "_mouse_pane"):
+            self._mouse_pane.setCursor(cursor)
+        self.setCursor(cursor)
+
     def mousePressEvent(self, e):
         if self._locked or e.button() != Qt.MouseButton.LeftButton:
             return
@@ -771,7 +999,7 @@ class LyricOverlay(QWidget):
         else:
             self._drag_pos   = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
             self._resize_dir = (0, 0)
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self._set_overlay_cursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, e):
         if self._locked:
@@ -787,24 +1015,53 @@ class LyricOverlay(QWidget):
                 elif dx ==  1: nw += ddx
                 if dy == -1: nh -= ddy; ny += ddy
                 elif dy ==  1: nh += ddy
-                nw, nh = max(200, nw), max(80, nh)
+                screen = self.screen() or QApplication.primaryScreen()
+                avail  = screen.availableGeometry()
+                nw = max(200, min(nw, avail.width()))
+                nh = max(80,  min(nh, avail.height()))
+                nx = max(avail.x(), min(nx, avail.right()  - nw))
+                ny = max(avail.y(), min(ny, avail.bottom() - nh))
                 self.setGeometry(nx, ny, nw, nh)
             elif not self._drag_pos.isNull():
                 self.move(e.globalPosition().toPoint() - self._drag_pos)
         else:
-            self.setCursor(self._cursor_for_dir(*self._get_resize_dir(e.position().toPoint())))
+            self._set_overlay_cursor(self._cursor_for_dir(*self._get_resize_dir(e.position().toPoint())))
 
     def mouseReleaseEvent(self, e):
         self._drag_pos = QPoint()
         self._resize_dir = (0, 0)
         self._resize_start_geo = None
+        self._resize_start_pos = None
         if not self._locked:
-            self.setCursor(self._cursor_for_dir(*self._get_resize_dir(e.position().toPoint())))
+            self._set_overlay_cursor(self._cursor_for_dir(*self._get_resize_dir(e.position().toPoint())))
+
+    def show_settings(self):
+        if not (_OV and hasattr(self, "canvas")):
+            return
+        from PyQt6.QtWidgets import QDialog
+        original_cfg = dict(self.cfg)
+
+        def on_preview(preview_cfg: dict):
+            self.setWindowOpacity(preview_cfg["opacity"])
+            self.canvas.apply_cfg(preview_cfg)
+
+        dlg = _OV.SettingsDialog(self.cfg, self, on_preview=on_preview)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.cfg = dlg.result_cfg()
+            self.setWindowOpacity(self.cfg["opacity"])
+            self.canvas.apply_cfg(self.cfg)
+            self.save_geometry()
+        else:
+            self.setWindowOpacity(original_cfg["opacity"])
+            self.canvas.apply_cfg(original_cfg)
 
     def contextMenuEvent(self, e):
         menu = QMenu(self)
         a = menu.addAction("歌詞ファイルを開く…")
         a.triggered.connect(self._open_lyrics)
+        menu.addSeparator()
+        a = menu.addAction("設定…")
+        a.triggered.connect(self.show_settings)
         menu.addSeparator()
         a = menu.addAction("ロック解除" if self._locked else "位置をロック")
         a.triggered.connect(self._toggle_lock)
@@ -821,12 +1078,21 @@ class LyricOverlay(QWidget):
     def _toggle_lock(self):
         self._locked = not self._locked
         self.cfg["locked"] = self._locked
+        self._update_zone_btn_icon()
+        self._zone_btn.hide()
+        self._unlock_visible = False
         if self._locked:
+            self._hovering = False
             self._drag_pos = QPoint()
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self._resize_dir = (0, 0)
+            self._resize_start_geo = None
+            self._resize_start_pos = None
+            self._set_overlay_cursor(Qt.CursorShape.ArrowCursor)
             self._set_clickthrough(True)
         else:
             self._set_clickthrough(False)
+        self.save_geometry()
+        self.update()
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
@@ -845,6 +1111,10 @@ class LyricOverlay(QWidget):
             self.cfg.update(x=self.x(), y=self.y(), w=self.width(), h=self.height(),
                             locked=self._locked)
             _OV.save_config(self.cfg)
+
+    def _queue_state_save(self):
+        if hasattr(self, "_state_save_timer"):
+            self._state_save_timer.start()
 
     def closeEvent(self, e):
         self.save_geometry()
@@ -868,6 +1138,9 @@ class PlayerWindow(QMainWindow):
         self._current: int            = -1
         self._loop:    LoopMode       = LoopMode.LOOP_ALL
         self._shuffle_history: List[int] = []
+        self._current_playlist_path: str = ""
+        self._volume: float = 1.0
+        self._pending_restore_pos_ms: Optional[int] = None
 
         # ── Media player ──
         self._player: Optional[QMediaPlayer] = None
@@ -876,17 +1149,16 @@ class PlayerWindow(QMainWindow):
             self._audio  = QAudioOutput()
             self._player = QMediaPlayer()
             self._player.setAudioOutput(self._audio)
-            self._audio.setVolume(1.0)
+            self._audio.setVolume(self._volume)
             self._player.positionChanged.connect(self._on_position)
             self._player.durationChanged.connect(self._on_duration)
             self._player.playbackStateChanged.connect(self._on_state_change)
             self._player.mediaStatusChanged.connect(self._on_media_status)
 
-        # ── Sync timer → overlay canvas ──
-        self._sync_timer = QTimer(self)
-        self._sync_timer.setInterval(200)
-        self._sync_timer.timeout.connect(self._push_sync)
-        self._sync_timer.start()
+        # ── Sync: use positionChanged (fires ~every 50-100 ms) instead of a
+        #    separate 200 ms poll timer — lower latency, no extra thread needed ──
+        if HAS_MEDIA and self._player:
+            self._player.positionChanged.connect(self._push_sync_from_position)
 
         # ── Overlay ──
         self._overlay: Optional[LyricOverlay] = (
@@ -929,8 +1201,9 @@ class PlayerWindow(QMainWindow):
         self._playlist.add_files.connect(self._add_tracks)
         self._playlist.remove_sel.connect(self._remove_selected)
         self._playlist.clear_all.connect(self._clear_all)
-        self._playlist.save_req.connect(self._save_playlist_dialog)
+        self._playlist.save_req.connect(self._save_playlist_now)
         self._playlist.load_req.connect(self._load_playlist_dialog)
+        self._playlist.assign_lyrics.connect(self._assign_lyrics_to_track)
         splitter.addWidget(self._playlist)
 
         splitter.setSizes([220, 580])
@@ -978,8 +1251,9 @@ class PlayerWindow(QMainWindow):
         fm = mb.addMenu("ファイル")
         _act(fm, "音声ファイルを追加…", self._add_files_dialog,  "Ctrl+O")
         fm.addSeparator()
-        _act(fm, "プレイリストを開く…", self._load_playlist_dialog, "Ctrl+L")
-        _act(fm, "プレイリストを保存…", self._save_playlist_dialog, "Ctrl+S")
+        _act(fm, "プレイリストを開く…",       self._load_playlist_dialog, "Ctrl+L")
+        _act(fm, "プレイリストを保存",         self._save_playlist_now,    "Ctrl+S")
+        _act(fm, "名前を付けて保存…",          self._save_playlist_as,     "Ctrl+Shift+S")
         fm.addSeparator()
         _act(fm, "終了", self.close, "Ctrl+Q")
 
@@ -987,6 +1261,8 @@ class PlayerWindow(QMainWindow):
         self._overlay_action = _act(vm, "歌詞オーバーレイ", self._toggle_overlay, checkable=True)
         self._overlay_action.setChecked(self._overlay is not None and self._overlay.isVisible())
         _act(vm, "歌詞ファイルを開く…", self._open_lyrics_for_current)
+        vm.addSeparator()
+        _act(vm, "歌詞オーバーレイ設定…", self._open_overlay_settings)
 
     def _build_shortcuts(self):
         QShortcut(QKeySequence(Qt.Key.Key_Space),      self).activated.connect(self._toggle_play)
@@ -1075,8 +1351,9 @@ class PlayerWindow(QMainWindow):
             self._player.setPosition(max(0, self._player.position() + delta))
 
     def _set_volume(self, v: float):
+        self._volume = max(0.0, min(1.0, v))
         if self._audio:
-            self._audio.setVolume(v)
+            self._audio.setVolume(self._volume)
 
     def _set_loop(self, mode: int):
         self._loop = LoopMode(mode)
@@ -1092,6 +1369,7 @@ class PlayerWindow(QMainWindow):
         if 0 <= self._current < len(self._tracks):
             self._tracks[self._current].dur_ms = ms
             self._playlist.rebuild(self._tracks, self._current)
+        self._apply_pending_restore_position()
 
     def _on_state_change(self, state):
         playing = (state == QMediaPlayer.PlaybackState.PlayingState)
@@ -1104,14 +1382,26 @@ class PlayerWindow(QMainWindow):
         if self._player and status == QMediaPlayer.MediaStatus.EndOfMedia:
             self.next_track()
 
+    def _apply_pending_restore_position(self):
+        if self._player and self._pending_restore_pos_ms is not None:
+            pos = max(0, int(self._pending_restore_pos_ms))
+            dur = self._player.duration()
+            if dur > 0:
+                pos = min(pos, max(0, dur - 1000))
+            self._player.setPosition(pos)
+            self._ctrl.set_position(pos, dur)
+            if self._overlay:
+                playing = self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                self._overlay.canvas.sync_time(pos / 1000.0, playing, force_hard=True)
+            self._pending_restore_pos_ms = None
+
     # ── Sync overlay canvas ───────────────────────────────────────────────────
 
-    def _push_sync(self):
+    def _push_sync_from_position(self, ms: int):
         if not (self._overlay and self._player):
             return
-        pos = self._player.position() / 1000.0
         playing = (self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
-        self._overlay.canvas.sync_time(pos, playing)
+        self._overlay.canvas.sync_time(ms / 1000.0, playing)
 
     # ── Track management ──────────────────────────────────────────────────────
 
@@ -1120,7 +1410,35 @@ class PlayerWindow(QMainWindow):
         self.setWindowTitle(f"furi-lrc Player — {track.display_title()}")
         self._playlist.highlight(self._current)
         if self._overlay:
-            self._overlay.auto_load_lyrics(track.path, track.display_title())
+            if track.lyrics_path and Path(track.lyrics_path).exists():
+                self._overlay._load_lyrics(track.lyrics_path)
+            else:
+                self._overlay.auto_load_lyrics(track.path, track.display_title())
+
+    def _prepare_current_track(self, pos_ms: int = 0, autoplay: bool = False):
+        if not (self._player and 0 <= self._current < len(self._tracks)):
+            return
+        track = self._tracks[self._current]
+        self._pending_restore_pos_ms = max(0, int(pos_ms))
+        self._player.setSource(QUrl.fromLocalFile(track.path))
+        self._on_track_started(track)
+        if autoplay:
+            self._player.play()
+        else:
+            self._player.pause()
+        QTimer.singleShot(0, self._apply_pending_restore_position)
+
+    def _assign_lyrics_to_track(self, row: int):
+        if not (0 <= row < len(self._tracks)):
+            return
+        p, _ = QFileDialog.getOpenFileName(
+            self, f"歌詞を指定 — {self._tracks[row].display_title()}", "", "JSON (*.json)"
+        )
+        if p:
+            self._tracks[row].lyrics_path = p
+            # if currently playing this track, reload lyrics immediately
+            if row == self._current and self._overlay:
+                self._overlay._load_lyrics(p)
 
     def _add_tracks(self, paths: List[str]):
         new = [_build_track(p) for p in paths]
@@ -1153,13 +1471,22 @@ class PlayerWindow(QMainWindow):
 
     # ── Playlist save / load ──────────────────────────────────────────────────
 
-    def _save_playlist_dialog(self):
+    def _save_playlist_now(self):
+        """Ctrl+S: save to current path, fall back to Save As dialog."""
+        if self._current_playlist_path:
+            self._save_playlist(self._current_playlist_path)
+        else:
+            self._save_playlist_as()
+
+    def _save_playlist_as(self):
+        """Ctrl+Shift+S: always prompt for a new path."""
         path, _ = QFileDialog.getSaveFileName(
-            self, "プレイリストを保存", "", f"furi-lrc Playlist (*{_PLAYLIST_EXT})"
+            self, "名前を付けて保存", "", f"furi-lrc Playlist (*{_PLAYLIST_EXT})"
         )
         if path:
             if not path.endswith(_PLAYLIST_EXT):
                 path += _PLAYLIST_EXT
+            self._current_playlist_path = path
             self._save_playlist(path)
 
     def _load_playlist_dialog(self):
@@ -1170,10 +1497,19 @@ class PlayerWindow(QMainWindow):
             self._load_playlist(path)
 
     def _save_playlist(self, path: str):
+        position_ms = self._player.position() if self._player else 0
+        playing = (
+            self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            if self._player else False
+        )
         data = {
-            "tracks":    [t.path for t in self._tracks],
+            "tracks":    [{"path": t.path, "lyrics": t.lyrics_path} for t in self._tracks],
             "current":   self._current,
             "loop_mode": int(self._loop),
+            "position_ms": position_ms,
+            "volume": self._volume,
+            "playing": playing,
+            "shuffle_history": self._shuffle_history,
         }
         try:
             Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
@@ -1186,14 +1522,45 @@ class PlayerWindow(QMainWindow):
         except Exception as e:
             print(f"[player] playlist load error: {e}", file=sys.stderr)
             return
-        self._tracks  = [_build_track(p) for p in data.get("tracks", []) if Path(p).exists()]
+        tracks = []
+        for entry in data.get("tracks", []):
+            # support both old format (str) and new format (dict)
+            if isinstance(entry, str):
+                p, lp = entry, ""
+            else:
+                p, lp = entry.get("path", ""), entry.get("lyrics", "")
+            if Path(p).exists():
+                t = _build_track(p)
+                t.lyrics_path = lp if lp and Path(lp).exists() else ""
+                tracks.append(t)
+        self._tracks  = tracks
         self._current = min(data.get("current", 0), len(self._tracks) - 1)
-        mode = LoopMode(data.get("loop_mode", int(LoopMode.LOOP_ALL)))
+        try:
+            mode = LoopMode(data.get("loop_mode", int(LoopMode.LOOP_ALL)))
+        except ValueError:
+            mode = LoopMode.LOOP_ALL
         self._loop = mode
         self._ctrl.set_loop_mode(mode)
+        self._volume = max(0.0, min(1.0, float(data.get("volume", self._volume))))
+        if self._audio:
+            self._audio.setVolume(self._volume)
+        self._ctrl.set_volume(self._volume)
+        self._shuffle_history = [
+            int(i) for i in data.get("shuffle_history", [])
+            if isinstance(i, int) and 0 <= i < len(self._tracks)
+        ]
         self._playlist.rebuild(self._tracks, self._current)
         if 0 <= self._current < len(self._tracks):
-            self._now_playing.update_track(self._tracks[self._current])
+            self._prepare_current_track(
+                int(data.get("position_ms", 0)),
+                False,
+            )
+        else:
+            self._now_playing.update_track(None)
+        # track the path for Ctrl+S quick-save (skip for _last_playlist auto-save)
+        last = str(Path(__file__).parent / "_last_playlist.flpl")
+        if path != last:
+            self._current_playlist_path = path
 
     def _load_last_playlist(self):
         last = Path(__file__).parent / "_last_playlist.flpl"
@@ -1216,6 +1583,10 @@ class PlayerWindow(QMainWindow):
         p, _ = QFileDialog.getOpenFileName(self, "歌詞 JSON を選択", "", "JSON (*.json)")
         if p:
             self._overlay._load_lyrics(p)
+
+    def _open_overlay_settings(self):
+        if self._overlay:
+            self._overlay.show_settings()
 
     # ── Window events ─────────────────────────────────────────────────────────
 

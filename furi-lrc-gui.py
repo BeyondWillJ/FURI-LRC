@@ -38,15 +38,16 @@ from PyQt6.QtWidgets import (
     QToolBar, QFileDialog, QMessageBox,
     QDialog, QDialogButtonBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QStyledItemDelegate, QStyle, QStyleOptionViewItem,
     QSlider, QFrame, QSizePolicy,
     QScrollArea, QTextEdit, QGroupBox, QMenu, QComboBox,
 )
 from PyQt6.QtCore import (
-    Qt, QTimer, QThread, pyqtSignal, QUrl, QSize, QPoint,
+    Qt, QTimer, QThread, pyqtSignal, QUrl, QSize,
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QPen, QBrush, QFont, QKeySequence, QShortcut,
-    QPainterPath, QAction, QLinearGradient, QFontMetrics, QIcon,
+    QPainterPath, QAction, QActionGroup, QLinearGradient, QFontMetrics, QIcon,
     QFontDatabase, QPalette,
 )
 
@@ -146,6 +147,16 @@ def segments_to_markup(segs: list) -> str:
         if seg.get('ruby'):
             reading = ''.join(u['k'] for u in seg.get('units', []))
             parts.append(f"{{{seg['base']}|{reading}}}")
+        else:
+            parts.append(''.join(u['k'] for u in seg.get('units', [])))
+    return ''.join(parts)
+
+
+def segments_to_display_text(segs: list) -> str:
+    parts = []
+    for seg in segs:
+        if seg.get('ruby'):
+            parts.append(seg.get('base') or ''.join(u['k'] for u in seg.get('units', [])))
         else:
             parts.append(''.join(u['k'] for u in seg.get('units', [])))
     return ''.join(parts)
@@ -330,6 +341,10 @@ class WaveformLoader(QThread):
 # ══════════════════════════════════════════════════════════════
 
 class WaveformWidget(QWidget):
+    HEIGHT_MIN = 40
+    HEIGHT_MAX = 180
+    HEIGHT_DEFAULT = 110
+
     seek_requested = pyqtSignal(int)          # ms
     line_time_changed = pyqtSignal(int, int)  # line_idx, new_ms (during drag)
     drag_start = pyqtSignal(int)              # line_idx drag began
@@ -349,14 +364,23 @@ class WaveformWidget(QWidget):
         self._envelope = None
         self._drag_line_idx = -1       # index of line marker being dragged
         self._hover_marker_idx = -1    # index of marker under cursor
-        self.setMinimumHeight(80)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.set_display_height(self.HEIGHT_DEFAULT)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
         self.setToolTip("左クリック: シーク  右ドラッグ: 歌詞マーカー移動  スクロール: 左右移動  Ctrl+スクロール: ズーム")
 
     # ─── public setters ───
+
+    def set_display_height(self, height: int):
+        height = max(self.HEIGHT_MIN, min(self.HEIGHT_MAX, int(height)))
+        self.setFixedHeight(height)
+        self.updateGeometry()
+        self.update()
+
+    def display_height(self) -> int:
+        return self.height()
 
     def set_audio(self, samples, sr: int):
         self._samples = samples
@@ -372,14 +396,19 @@ class WaveformWidget(QWidget):
     def set_duration(self, ms: int):
         if ms > 0 and self._samples is None:
             self._duration_ms = ms
+        self._scroll_ms = self._clamp_scroll(self._scroll_ms)
         self.update()
 
     def set_position(self, ms: int):
         self._position_ms = ms
         v = self._vis_ms()
-        lo, hi = self._scroll_ms, self._scroll_ms + v
-        if ms < lo or ms > hi * 0.92:
-            self._scroll_ms = max(0.0, ms - v * 0.08)
+        lo = self._scroll_ms
+        left_trigger = lo + v * 0.03
+        right_trigger = lo + v * 0.97
+        if ms < left_trigger:
+            self._scroll_ms = self._clamp_scroll(ms - v * 0.18)
+        elif ms > right_trigger:
+            self._scroll_ms = self._clamp_scroll(ms - v * 0.18)
         self.update()
 
     def set_lines(self, lines: list, sel: int = -1):
@@ -407,6 +436,11 @@ class WaveformWidget(QWidget):
 
     def _vis_ms(self) -> float:
         return self._duration_ms / self._zoom if self._duration_ms > 0 else 60000.0
+
+    def _clamp_scroll(self, value: float) -> float:
+        if self._duration_ms <= 0:
+            return max(0.0, float(value))
+        return max(0.0, min(float(value), max(0.0, self._duration_ms - self._vis_ms())))
 
     def _ms_to_x(self, ms) -> float:
         v = self._vis_ms()
@@ -602,10 +636,10 @@ class WaveformWidget(QWidget):
             self._zoom = max(1.0, min(300.0, self._zoom * factor))
             v = self._vis_ms()
             offset = e.position().x() / (self.width() or 1) * v
-            self._scroll_ms = max(0.0, cursor_ms - offset)
+            self._scroll_ms = self._clamp_scroll(cursor_ms - offset)
         else:
             shift = self._vis_ms() * 0.15 * (-1 if delta > 0 else 1)
-            self._scroll_ms = max(0.0, self._scroll_ms + shift)
+            self._scroll_ms = self._clamp_scroll(self._scroll_ms + shift)
         self.update()
 
 
@@ -874,51 +908,69 @@ class LineEditor(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(6)
 
-        # Header
+        # Compact line summary and timing controls
+        meta_row = QHBoxLayout()
+        meta_row.setSpacing(6)
         self._header = QLabel("（行を選択してください）")
-        self._header.setStyleSheet("color:#555;font-weight:bold;")
-        layout.addWidget(self._header)
+        self._header.setStyleSheet("color:#444;font-weight:bold;font-size:13px;")
+        meta_row.addWidget(self._header)
+        meta_row.addStretch()
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#ccc;")
-        layout.addWidget(sep)
-
-        # Time row
-        time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("開始:"))
+        start_label = QLabel("開始")
+        start_label.setStyleSheet("color:#666;")
+        meta_row.addWidget(start_label)
         self._time_edit = TimeEdit()
         self._time_edit.time_changed.connect(self._on_time_changed)
-        time_row.addWidget(self._time_edit)
+        self._time_edit.setFixedWidth(118)
+        meta_row.addWidget(self._time_edit)
         self._set_now_btn = QPushButton("⏱")
         self._set_now_btn.setToolTip("再生中の時間を開始時間に設定 (T)")
         self._set_now_btn.clicked.connect(self._set_to_now)
-        self._set_now_btn.setFixedWidth(32)
-        time_row.addWidget(self._set_now_btn)
-        time_row.addSpacing(10)
-        time_row.addWidget(QLabel("終了:"))
+        self._set_now_btn.setFixedSize(30, 28)
+        meta_row.addWidget(self._set_now_btn)
+
+        end_label = QLabel("終了")
+        end_label.setStyleSheet("color:#666;")
+        meta_row.addWidget(end_label)
         self._end_edit = TimeEdit()
         self._end_edit.setToolTip(
             "字幕の終了時間。未設定の場合は次の行の開始時間を使用します。"
         )
         self._end_edit.time_changed.connect(self._on_end_changed)
-        time_row.addWidget(self._end_edit)
+        self._end_edit.setFixedWidth(118)
+        meta_row.addWidget(self._end_edit)
         self._set_end_now_btn = QPushButton("⏱")
         self._set_end_now_btn.setToolTip("再生中の時間を終了時間に設定")
         self._set_end_now_btn.clicked.connect(self._set_end_to_now)
-        self._set_end_now_btn.setFixedWidth(32)
-        time_row.addWidget(self._set_end_now_btn)
-        time_row.addStretch()
-        layout.addLayout(time_row)
+        self._set_end_now_btn.setFixedSize(30, 28)
+        meta_row.addWidget(self._set_end_now_btn)
+        layout.addLayout(meta_row)
 
         # JP markup
-        jp_grp = QGroupBox("日本語 (JP)  ← {漢字|かんじ} 形式でルビ付与")
-        jp_lay = QVBoxLayout(jp_grp)
+        jp_panel = QWidget()
+        jp_lay = QVBoxLayout(jp_panel)
+        jp_lay.setContentsMargins(0, 0, 0, 0)
+        jp_lay.setSpacing(4)
+        jp_head = QHBoxLayout()
+        jp_head.setSpacing(6)
+        jp_title = QLabel("日本語 (JP)")
+        jp_title.setStyleSheet("font-weight:bold;color:#333;")
+        jp_head.addWidget(jp_title)
+        jp_hint = QLabel("{漢字|かんじ} 形式")
+        jp_hint.setStyleSheet("color:#777;font-size:11px;")
+        jp_head.addWidget(jp_hint)
+        jp_head.addStretch()
+        apply_jp_btn = QPushButton("JP解析")
+        apply_jp_btn.setToolTip("テキストを解析してユニット表を再生成します（既存の時間は上書きされます）")
+        apply_jp_btn.clicked.connect(self._apply_jp)
+        apply_jp_btn.setFixedHeight(28)
+        jp_head.addWidget(apply_jp_btn)
+        jp_lay.addLayout(jp_head)
         self._jp_edit = QTextEdit()
-        self._jp_edit.setFixedHeight(60)
+        self._jp_edit.setFixedHeight(54)
         self._jp_edit.setPlaceholderText("{東京|とうきょう}へ{行|い}く")
         self._jp_edit.setFont(QFont(_NOTO_JP or "", 13))
         self._jp_edit.setAcceptRichText(False)
@@ -930,11 +982,7 @@ class LineEditor(QWidget):
         sc_ruby = QShortcut(QKeySequence("Ctrl+R"), self._jp_edit)
         sc_ruby.setContext(Qt.ShortcutContext.WidgetShortcut)
         sc_ruby.activated.connect(self._insert_ruby)
-        apply_jp_btn = QPushButton("↻ JP解析・ユニット表更新")
-        apply_jp_btn.setToolTip("テキストを解析してユニット表を再生成します（既存の時間は上書きされます）")
-        apply_jp_btn.clicked.connect(self._apply_jp)
-        jp_lay.addWidget(apply_jp_btn)
-        layout.addWidget(jp_grp)
+        layout.addWidget(jp_panel)
 
         # ZH translation
         zh_grp = QGroupBox("中文訳 (ZH)")
@@ -948,6 +996,7 @@ class LineEditor(QWidget):
 
         # Unit table
         unit_grp = QGroupBox("ユニット時間 (ダブルクリックで編集)")
+        unit_grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         unit_lay = QVBoxLayout(unit_grp)
 
         self._unit_table = QTableWidget(0, 4)
@@ -959,9 +1008,10 @@ class LineEditor(QWidget):
         self._unit_table.setColumnWidth(0, 60)
         self._unit_table.setColumnWidth(1, 60)
         self._unit_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._unit_table.setMinimumHeight(160)
+        self._unit_table.setMinimumHeight(72)
+        self._unit_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._unit_table.itemChanged.connect(self._on_unit_cell_changed)
-        unit_lay.addWidget(self._unit_table)
+        unit_lay.addWidget(self._unit_table, 1)
 
         tap_row = QHBoxLayout()
         self._tap_units_btn = QPushButton("🎯 ユニット打拍")
@@ -974,8 +1024,7 @@ class LineEditor(QWidget):
         self._dist_btn.clicked.connect(self._distribute_units)
         tap_row.addWidget(self._dist_btn)
         unit_lay.addLayout(tap_row)
-        layout.addWidget(unit_grp)
-        layout.addStretch()
+        layout.addWidget(unit_grp, 1)
 
     def set_player(self, player):
         self._player = player
@@ -1236,8 +1285,133 @@ class LineEditor(QWidget):
 #  Lyrics list (left panel)
 # ══════════════════════════════════════════════════════════════
 
+LYRICS_LIST_TIME_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+LYRICS_LIST_SEGS_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+
+
+class RubyLyricsDelegate(QStyledItemDelegate):
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        base_font = option.font
+        if base_font.pointSizeF() <= 0:
+            base_font.setPointSizeF(11)
+        ruby_font = QFont(base_font)
+        ruby_font.setPointSizeF(max(5.5, base_font.pointSizeF() * 0.56))
+        base_fm = QFontMetrics(base_font)
+        ruby_fm = QFontMetrics(ruby_font)
+        compact_h = ruby_fm.height() + base_fm.height() - 6
+        return QSize(size.width(), max(size.height(), compact_h + 4))
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+
+        painter.save()
+        rect = option.rect.adjusted(6, 1, -6, -1)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        text_color = opt.palette.color(
+            QPalette.ColorRole.HighlightedText if selected else QPalette.ColorRole.Text
+        )
+        muted_color = QColor(text_color)
+        muted_color.setAlpha(170)
+
+        base_font = option.font
+        if base_font.pointSizeF() <= 0:
+            base_font.setPointSizeF(11)
+        ruby_font = QFont(base_font)
+        ruby_font.setPointSizeF(max(5.5, base_font.pointSizeF() * 0.56))
+
+        time_text = index.data(LYRICS_LIST_TIME_ROLE) or ""
+        time_font = QFont(base_font)
+        time_font.setPointSizeF(max(7.0, base_font.pointSizeF() * 0.86))
+        time_fm = QFontMetrics(time_font)
+        time_width = time_fm.horizontalAdvance("00:00.000")
+        time_y = rect.top() + (rect.height() + time_fm.ascent() - time_fm.descent()) // 2
+        painter.setFont(time_font)
+        painter.setPen(muted_color)
+        painter.drawText(rect.left(), time_y, time_text)
+
+        lyric_rect = rect.adjusted(time_width + 10, 0, 0, 0)
+        segs = index.data(LYRICS_LIST_SEGS_ROLE) or []
+        if not segs:
+            painter.setFont(base_font)
+            painter.setPen(text_color)
+            fm = QFontMetrics(base_font)
+            empty = fm.elidedText("（空）", Qt.TextElideMode.ElideRight, lyric_rect.width())
+            painter.drawText(lyric_rect.left(), time_y, empty)
+            painter.restore()
+            return
+
+        self._draw_segments(
+            painter, lyric_rect, segs, base_font, ruby_font, text_color, muted_color
+        )
+        painter.restore()
+
+    def _draw_segments(self, painter, rect, segs, base_font, ruby_font, text_color, ruby_color):
+        base_fm = QFontMetrics(base_font)
+        ruby_fm = QFontMetrics(ruby_font)
+        x = rect.left()
+        right = rect.right()
+        overlap = 5
+        block_h = ruby_fm.height() + base_fm.height() - overlap
+        block_top = rect.top() + max(0, (rect.height() - block_h) // 2)
+        ruby_y = block_top + ruby_fm.ascent()
+        base_y = block_top + ruby_fm.height() - overlap + base_fm.ascent()
+        ellipsis = "..."
+        ellipsis_w = base_fm.horizontalAdvance(ellipsis)
+
+        def draw_ellipsis():
+            if x <= right:
+                painter.setFont(base_font)
+                painter.setPen(text_color)
+                painter.drawText(x, base_y, ellipsis)
+
+        for seg in segs:
+            if seg.get('ruby'):
+                base = seg.get('base') or ''.join(u['k'] for u in seg.get('units', []))
+                ruby = ''.join(u['k'] for u in seg.get('units', []))
+                base_w = base_fm.horizontalAdvance(base)
+                ruby_w = ruby_fm.horizontalAdvance(ruby)
+                w = max(base_w, ruby_w)
+                if x + w > right + 1:
+                    draw_ellipsis()
+                    return
+                painter.setFont(ruby_font)
+                painter.setPen(ruby_color)
+                painter.drawText(int(x + (w - ruby_w) / 2), ruby_y, ruby)
+                painter.setFont(base_font)
+                painter.setPen(text_color)
+                painter.drawText(int(x + (w - base_w) / 2), base_y, base)
+                x += w + 2
+            else:
+                text = ''.join(u['k'] for u in seg.get('units', []))
+                if not text:
+                    continue
+                remaining = right - x + 1
+                if remaining <= ellipsis_w:
+                    draw_ellipsis()
+                    return
+                text_w = base_fm.horizontalAdvance(text)
+                painter.setFont(base_font)
+                painter.setPen(text_color)
+                if text_w <= remaining:
+                    painter.drawText(x, base_y, text)
+                    x += text_w
+                else:
+                    painter.drawText(
+                        x,
+                        base_y,
+                        base_fm.elidedText(text, Qt.TextElideMode.ElideRight, remaining),
+                    )
+                    return
+
+
 class LyricsListPanel(QWidget):
     selection_changed = pyqtSignal(int)   # selected index
+    jump_requested = pyqtSignal(int)      # double-clicked index
     add_requested = pyqtSignal()
     delete_requested = pyqtSignal(int)
     move_requested = pyqtSignal(int, int)   # from_idx, to_idx
@@ -1259,7 +1433,12 @@ class LyricsListPanel(QWidget):
         self._list = QListWidget()
         self._list.setFont(QFont(_NOTO_JP or "", 11))
         self._list.setAlternatingRowColors(True)
+        self._list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list.setWordWrap(False)
+        self._list.setItemDelegate(RubyLyricsDelegate(self._list))
         self._list.currentRowChanged.connect(self.selection_changed)
+        self._list.itemDoubleClicked.connect(self._jump_to_item)
         layout.addWidget(self._list)
 
         btn_row = QHBoxLayout()
@@ -1298,13 +1477,22 @@ class LyricsListPanel(QWidget):
         if 0 <= target < self._list.count():
             self.move_requested.emit(row, target)
 
+    def _jump_to_item(self, item: QListWidgetItem):
+        row = self._list.row(item)
+        if row >= 0:
+            self.jump_requested.emit(row)
+
     def refresh(self, lines: list, sel: int = -1):
         self._list.blockSignals(True)
         self._list.clear()
         for i, line in enumerate(lines):
-            preview = segments_to_markup(line.get('jp', []))[:18] or '（空）'
-            text = f"{ms_to_str(line['start'])}  {preview}"
+            preview = segments_to_display_text(line.get('jp', [])) or '（空）'
+            time_text = ms_to_str(line['start'])
+            text = f"{time_text}  {preview}"
             item = QListWidgetItem(text)
+            item.setData(LYRICS_LIST_TIME_ROLE, time_text)
+            item.setData(LYRICS_LIST_SEGS_ROLE, line.get('jp', []))
+            item.setToolTip(text)
             if i == self._tap_idx:
                 item.setBackground(QColor(255, 245, 190))
                 item.setForeground(QColor(130, 75, 0))
@@ -1329,11 +1517,15 @@ class LyricsListPanel(QWidget):
 # ══════════════════════════════════════════════════════════════
 
 class AudioControlBar(QWidget):
+    CHROME_HEIGHT = 54
+
     seek_requested = pyqtSignal(int)     # ms
+    status_message = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
         self._duration_ms = 0
+        self._waveform_height = WaveformWidget.HEIGHT_DEFAULT
         self._player: Optional[QMediaPlayer] = None
         self._audio_out: Optional[QAudioOutput] = None
         if HAS_MULTIMEDIA:
@@ -1343,6 +1535,8 @@ class AudioControlBar(QWidget):
             self._audio_out.setVolume(1.0)
             self._player.positionChanged.connect(self._on_position)
             self._player.durationChanged.connect(self._on_duration)
+            self._player.playbackStateChanged.connect(self._on_playback_state_changed)
+            self._player.errorOccurred.connect(self._on_media_error)
         self._build_ui()
 
     def _build_ui(self):
@@ -1353,6 +1547,7 @@ class AudioControlBar(QWidget):
         # Waveform
         self.waveform = WaveformWidget()
         self.waveform.seek_requested.connect(self._seek)
+        self.waveform.set_display_height(self._waveform_height)
         outer.addWidget(self.waveform, 1)
 
         # Transport row
@@ -1424,11 +1619,34 @@ class AudioControlBar(QWidget):
             row.addWidget(QLabel("⚠ PyQt6-Qt6Multimedia 未インストール"))
 
         outer.addLayout(row)
+        self.set_waveform_height(self._waveform_height)
+
+    def set_waveform_height(self, height: int):
+        height = max(WaveformWidget.HEIGHT_MIN, min(WaveformWidget.HEIGHT_MAX, int(height)))
+        self._waveform_height = height
+        if hasattr(self, 'waveform'):
+            self.waveform.set_display_height(height)
+        chrome_height = self.CHROME_HEIGHT
+        self.setMinimumHeight(WaveformWidget.HEIGHT_MIN + chrome_height)
+        self.updateGeometry()
+
+    def waveform_height(self) -> int:
+        return self._waveform_height
+
+    def waveform_chrome_height(self) -> int:
+        return self.CHROME_HEIGHT
 
     def load_audio(self, path: str):
         if not HAS_MULTIMEDIA or self._player is None:
+            self.status_message.emit("音声再生機能が利用できません（PyQt6-Qt6Multimedia を確認してください）")
             return
+        if self._audio_out is None:
+            self._audio_out = QAudioOutput()
+        self._player.setAudioOutput(self._audio_out)
+        self._audio_out.setVolume(self._vol_slider.value() / 100.0)
+        self._player.stop()
         self._player.setSource(QUrl.fromLocalFile(path))
+        self.status_message.emit(f"音声を読み込みました: {Path(path).name}")
 
     def get_player(self) -> Optional[QMediaPlayer]:
         return self._player
@@ -1446,12 +1664,13 @@ class AudioControlBar(QWidget):
             return
         if self.is_playing():
             self._player.pause()
-            self._btn_play.setChecked(False)
-            self._btn_play.setText("▶")
         else:
+            if self._audio_out is not None:
+                self._player.setAudioOutput(self._audio_out)
+                self._audio_out.setVolume(self._vol_slider.value() / 100.0)
+            if self._vol_slider.value() <= 0:
+                self.status_message.emit("音量が 0 です")
             self._player.play()
-            self._btn_play.setChecked(True)
-            self._btn_play.setText("⏸")
 
     def _toggle_play(self):
         self.play_pause()
@@ -1473,6 +1692,11 @@ class AudioControlBar(QWidget):
         self._duration_ms = ms
         self.waveform.set_duration(ms)
 
+    def _on_playback_state_changed(self, state):
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self._btn_play.setChecked(playing)
+        self._btn_play.setText("⏸" if playing else "▶")
+
     def _on_speed_change(self, idx: int):
         speeds = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
         if self._player:
@@ -1481,6 +1705,12 @@ class AudioControlBar(QWidget):
     def _on_vol_change(self, val: int):
         if self._audio_out:
             self._audio_out.setVolume(val / 100.0)
+
+    def _on_media_error(self, error, error_string: str = ""):
+        if error == QMediaPlayer.Error.NoError:
+            return
+        msg = error_string or str(error)
+        self.status_message.emit(f"音声再生エラー: {msg}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1499,6 +1729,8 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._undo_stack: list = []
         self._redo_stack: list = []
+        self._ui_scale = 1.0
+        self._scale_actions: dict = {}
 
         # Tap mode state
         self._tap_mode = False        # line-start tap mode
@@ -1525,6 +1757,7 @@ class MainWindow(QMainWindow):
         # Audio bar (bottom)
         self._audio = AudioControlBar()
         self._audio.seek_requested.connect(self._on_seek)
+        self._audio.status_message.connect(self._status_audio)
         self._audio.waveform.drag_start.connect(self._on_waveform_drag_start)
         self._audio.waveform.line_time_changed.connect(self._on_waveform_line_drag)
         self._audio.waveform.drag_end.connect(self._on_waveform_drag_end)
@@ -1532,6 +1765,7 @@ class MainWindow(QMainWindow):
         # Left: lyrics list
         self._list_panel = LyricsListPanel()
         self._list_panel.selection_changed.connect(self._on_line_selected)
+        self._list_panel.jump_requested.connect(self._jump_to_line)
         self._list_panel.add_requested.connect(self._add_line)
         self._list_panel.delete_requested.connect(self._delete_line)
         self._list_panel.move_requested.connect(self._move_line)
@@ -1553,48 +1787,52 @@ class MainWindow(QMainWindow):
         self._splitter.addWidget(self._editor)
         self._splitter.setSizes([220, 900])
 
-        # Central layout
-        central = QWidget()
-        cv = QVBoxLayout(central)
-        cv.setContentsMargins(0, 0, 0, 0)
-        cv.setSpacing(0)
-        cv.addWidget(self._splitter, 1)
+        # Central vertical splitter: editor area / audio area
+        self._audio.set_waveform_height(self._audio.waveform_height())
+        self._main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._main_splitter.addWidget(self._splitter)
+        self._main_splitter.addWidget(self._audio)
+        self._main_splitter.setHandleWidth(7)
+        self._main_splitter.setStretchFactor(0, 1)
+        self._main_splitter.setStretchFactor(1, 0)
+        self._main_splitter.setCollapsible(0, False)
+        self._main_splitter.setCollapsible(1, False)
+        self._main_splitter.splitterMoved.connect(self._sync_waveform_height_from_audio_panel)
+        self._main_splitter.setStyleSheet(
+            "QSplitter::handle:vertical{"
+            "background:#f8f9fd;border-top:1px solid #cdd1e1;"
+            "border-bottom:1px solid #eef0f8;"
+            "}"
+            "QSplitter::handle:vertical:hover{background:#e8ebf5;}"
+        )
+        self._main_splitter.setSizes([620, self._audio.minimumHeight()])
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#ccc;")
-        cv.addWidget(sep)
-
-        self._audio.setMaximumHeight(240)
-        self._audio.setMinimumHeight(160)
-        cv.addWidget(self._audio, 0)
-
-        self.setCentralWidget(central)
+        self.setCentralWidget(self._main_splitter)
 
         # ── Row 1: Menu bar (file / LRC operations, collapsible) ──
         mb = self.menuBar()
         mb.setStyleSheet(
             "QMenuBar{"
             "background:#eef0f8;border-bottom:1px solid #d2d5ea;"
-            "padding:2px 8px;spacing:2px;"
+            "padding:1px 6px;spacing:1px;"
             "}"
             "QMenuBar::item{"
-            "padding:4px 16px;border-radius:5px;background:transparent;"
+            "padding:3px 12px;border-radius:4px;background:transparent;"
             "color:#2a2c3e;"
             "}"
             "QMenuBar::item:selected{background:#dde0f4;}"
             "QMenuBar::item:pressed{background:#cdd0ec;}"
             "QMenu{"
             "background:#ffffff;border:1px solid #cdd0ea;"
-            "border-radius:8px;padding:5px 0;"
+            "border-radius:6px;padding:3px 0;"
             "}"
             "QMenu::item{"
-            "padding:7px 36px 7px 20px;border-radius:4px;margin:1px 6px;"
+            "padding:4px 24px 4px 12px;border-radius:3px;margin:1px 4px;"
             "color:#1a1c2e;"
             "}"
             "QMenu::item:selected{background:#eaecf8;}"
             "QMenu::item:disabled{color:#aaa;}"
-            "QMenu::separator{height:1px;background:#e4e7f2;margin:5px 12px;}"
+            "QMenu::separator{height:1px;background:#e4e7f2;margin:3px 8px;}"
         )
 
         _fm = mb.addMenu("ファイル")
@@ -1646,6 +1884,25 @@ class MainWindow(QMainWindow):
         _act_json_out.triggered.connect(self._export_json)
         _fm.addAction(_act_json_out)
 
+        _wm = mb.addMenu("ウィンドウ")
+        _scale_menu = _wm.addMenu("表示倍率")
+        _scale_group = QActionGroup(self)
+        _scale_group.setExclusive(True)
+        for label, scale in (
+            ("80%", 0.80),
+            ("90%", 0.90),
+            ("100%", 1.00),
+            ("110%", 1.10),
+        ):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setData(scale)
+            act.triggered.connect(lambda checked=False, s=scale: self._set_ui_scale(s))
+            _scale_group.addAction(act)
+            _scale_menu.addAction(act)
+            self._scale_actions[scale] = act
+        self._scale_actions[self._ui_scale].setChecked(True)
+
         # ── Row 2: Toolbar (editing tools, always visible) ──
         tb = QToolBar("編集")
         tb.setIconSize(QSize(20, 20))
@@ -1678,6 +1935,56 @@ class MainWindow(QMainWindow):
         # Status bar
         self._status = self.statusBar()
         self._status.showMessage("準備完了")
+
+    def _sync_waveform_height_from_audio_panel(self, *_):
+        target = self._audio.height() - self._audio.waveform_chrome_height()
+        self._audio.set_waveform_height(target)
+
+    def _status_audio(self, msg: str):
+        if hasattr(self, '_status'):
+            self._status.showMessage(msg)
+
+    def _set_ui_scale(self, scale: float, resize_window: bool = True, mark_dirty: bool = True):
+        scale = max(0.75, min(1.20, float(scale)))
+        old_scale = self._ui_scale
+        changed = abs(old_scale - scale) >= 0.001
+        self._ui_scale = scale
+
+        for s, act in self._scale_actions.items():
+            act.setChecked(abs(s - scale) < 0.001)
+
+        app = QApplication.instance()
+        if app is not None:
+            self._scale_widget_fonts(app.allWidgets(), scale)
+
+        if resize_window and old_scale > 0:
+            ratio = scale / old_scale
+            geom = self.geometry()
+            self.resize(
+                max(760, int(geom.width() * ratio)),
+                max(520, int(geom.height() * ratio)),
+            )
+        self.updateGeometry()
+        if changed and mark_dirty and (
+            self._save_path is None or self._save_path.lower().endswith('.flproj')
+        ):
+            self._dirty = True
+            self._status.showMessage(f"表示倍率: {int(scale * 100)}%")
+
+    def _scale_widget_fonts(self, widgets, scale: float):
+        updates = []
+        for widget in widgets:
+            font = widget.font()
+            base = widget.property("_base_point_size")
+            if base is None:
+                base = font.pointSizeF()
+                if base <= 0:
+                    base = 10.0
+                widget.setProperty("_base_point_size", base)
+            updates.append((widget, font, float(base)))
+        for widget, font, base in updates:
+            font.setPointSizeF(max(6.0, float(base) * scale))
+            widget.setFont(font)
 
     def _build_shortcuts(self):
         # Space = play/pause (only when no text-edit focused)
@@ -1888,15 +2195,18 @@ class MainWindow(QMainWindow):
                     "w": geom.width(), "h": geom.height(),
                 },
                 "splitter_sizes": self._splitter.sizes(),
+                "main_splitter_sizes": self._main_splitter.sizes(),
                 "waveform": {
                     "zoom": self._audio.waveform._zoom,
                     "scroll_ms": self._audio.waveform._scroll_ms,
+                    "height": self._audio.waveform_height(),
                 },
                 "options": {
                     "speed_idx": (self._audio._speed_combo.currentIndex()
                                   if self._audio._speed_combo else 2),
                     "volume": (self._audio._vol_slider.value()
                                if hasattr(self._audio, '_vol_slider') else 100),
+                    "ui_scale": self._ui_scale,
                 },
             }
             Path(path).write_text(
@@ -1936,11 +2246,17 @@ class MainWindow(QMainWindow):
             sizes = raw.get("splitter_sizes")
             if sizes and len(sizes) == 2:
                 self._splitter.setSizes(sizes)
+            main_sizes = raw.get("main_splitter_sizes")
+            if main_sizes and len(main_sizes) == 2:
+                self._main_splitter.setSizes(main_sizes)
             # Schedule waveform view restore (applied after waveform loads)
             wf = raw.get("waveform", {})
             if wf:
                 self._pending_wf_zoom = max(1.0, float(wf.get("zoom", 1.0)))
                 self._pending_wf_scroll = max(0.0, float(wf.get("scroll_ms", 0.0)))
+                self._audio.set_waveform_height(
+                    wf.get("height", WaveformWidget.HEIGHT_DEFAULT)
+                )
             # Restore options
             opts = raw.get("options", {})
             if self._audio._speed_combo:
@@ -1950,6 +2266,11 @@ class MainWindow(QMainWindow):
                 )
             if hasattr(self._audio, '_vol_slider'):
                 self._audio._vol_slider.setValue(opts.get("volume", 100))
+            self._set_ui_scale(
+                opts.get("ui_scale", 1.0),
+                resize_window=False,
+                mark_dirty=False,
+            )
             # Load audio
             audio_path = raw.get("audio_path", "")
             audio_ok = False
@@ -2074,6 +2395,13 @@ class MainWindow(QMainWindow):
                 idx = i
         if idx >= 0 and idx != self._list_panel.current_row():
             self._list_panel.set_current_row(idx)
+
+    def _jump_to_line(self, idx: int):
+        if 0 <= idx < len(self._lines):
+            ms = int(self._lines[idx].get('start', 0))
+            self._list_panel.set_current_row(idx)
+            self._audio._seek(ms)
+            self._status.showMessage(f"移動: 行 {idx + 1}  {ms_to_str(ms)}")
 
     def _set_sel_to_now(self):
         """T key: set selected line's start to current position."""
@@ -2335,7 +2663,20 @@ class MainWindow(QMainWindow):
 
 def main():
     import os
+    # Keep Qt rendering in logical pixels and let the OS/Qt choose native backing
+    # scale. PassThrough avoids blurry fractional-DPI rounding on mixed displays.
+    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+    os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+    os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu-compositing")
+
+    if (
+        hasattr(QApplication, "setHighDpiScaleFactorRoundingPolicy")
+        and hasattr(Qt, "HighDpiScaleFactorRoundingPolicy")
+    ):
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
 
     app = QApplication(sys.argv)
     app.setApplicationName("furi-lrc-gui")

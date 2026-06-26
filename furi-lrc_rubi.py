@@ -58,7 +58,8 @@ DEFAULT_CFG = dict(
     opacity=0.88, locked=False,
     font_jp=str(FONTS_DIR / "NotoSerifJP-SemiBold.ttf"),
     font_zh=str(FONTS_DIR / "msyhbd.ttc"),
-    font_size_jp=20, font_size_zh=14, spacing_zh=-8,
+    font_size_jp=20, font_size_rt=10, font_size_zh=14,
+    spacing_rt=2, spacing_zh=-8,
     color_sung="#4fc3f7", color_unsung="#888888", color_zh="#aaaaaa",
     lyrics_path="", hide_on_pause=True, unlock_zone=48,
     text_shadow="2px 2px 8px rgba(0,0,0,0.85)",
@@ -250,8 +251,9 @@ class LyricsCanvas(QWidget):
         self._px_unsung:    List[Optional[QPixmap]]             = []
         self._px_sung:      List[Optional[QPixmap]]             = []
         self._sweep_params: List[Optional[Tuple[float, float]]] = []  # (x_off, scale)
-        self._cache_win_w:  int = 0
-        self._cache_win_h:  int = 0
+        self._cache_win_w:  int   = 0
+        self._cache_win_h:  int   = 0
+        self._cache_dpr:    float = 0.0
 
         # Phase 4: self-walking clock
         self._base_ms:    float = 0.0
@@ -262,6 +264,10 @@ class LyricsCanvas(QWidget):
         self._active_i:    int   = -1
         self._fade_alpha:  float = 0.0
         self._fade_target: float = 1.0
+
+        # Sweep smoothing: exponential low-pass filter to avoid jitter
+        self._sweep_smooth:    float = 0.0   # smoothed sweep_x in window pixels
+        self._sweep_last_li:   int   = -1    # line index sweep_smooth belongs to
 
         # Fonts (rebuilt in apply_cfg / _rebuild_fonts)
         self._font_jp = QFont()
@@ -334,6 +340,7 @@ class LyricsCanvas(QWidget):
             cfg.get("font_jp")      != prev.get("font_jp")      or
             cfg.get("font_zh")      != prev.get("font_zh")      or
             cfg.get("font_size_jp") != prev.get("font_size_jp") or
+            cfg.get("font_size_rt") != prev.get("font_size_rt") or
             cfg.get("font_size_zh") != prev.get("font_size_zh") or
             not prev
         )
@@ -342,6 +349,7 @@ class LyricsCanvas(QWidget):
             cfg.get("color_unsung") != prev.get("color_unsung") or
             cfg.get("color_zh")     != prev.get("color_zh")     or
             cfg.get("text_shadow")  != prev.get("text_shadow")  or
+            cfg.get("spacing_rt")   != prev.get("spacing_rt")   or
             cfg.get("spacing_zh")   != prev.get("spacing_zh")
         )
         if font_changed:
@@ -354,7 +362,7 @@ class LyricsCanvas(QWidget):
     def _rebuild_fonts(self) -> None:
         cfg   = self._cfg
         sz_jp = cfg.get("font_size_jp", 20)
-        sz_rt = max(8, sz_jp // 2)
+        sz_rt = cfg.get("font_size_rt", max(8, sz_jp // 2))
         sz_zh = cfg.get("font_size_zh", 14)
         jp_p  = cfg.get("font_jp", "")
         zh_p  = cfg.get("font_zh", "")
@@ -447,12 +455,17 @@ class LyricsCanvas(QWidget):
         if W <= 0 or H <= 0:
             return
 
+        # HiDPI: render at physical pixel resolution
+        dpr  = self.devicePixelRatioF()
+        PW   = int(W * dpr)
+        PH   = int(H * dpr)
+
         # ── Phase 5: geometry computed here, not in paintEvent ──
         fm_jp   = self._fm_jp
         fm_rt   = self._fm_rt
         fm_zh   = self._fm_zh
         rt_h    = fm_rt.ascent() + fm_rt.descent()
-        gap     = 2.0
+        gap     = float(cfg.get("spacing_rt", 2))
         spacing = float(cfg.get("spacing_zh", -8))
         has_zh  = bool(layout.zh_text)
 
@@ -478,10 +491,12 @@ class LyricsCanvas(QWidget):
         color_unsung = QColor(cfg.get("color_unsung", "#888888"))
         color_zh_c   = QColor(cfg.get("color_zh",     "#aaaaaa"))
 
-        # ── Allocate two transparent pixmaps ──
-        px_u = QPixmap(W, H)
+        # ── Allocate two transparent pixmaps at physical resolution ──
+        px_u = QPixmap(PW, PH)
+        px_u.setDevicePixelRatio(dpr)
         px_u.fill(QColor(0, 0, 0, 0))
-        px_s = QPixmap(W, H)
+        px_s = QPixmap(PW, PH)
+        px_s.setDevicePixelRatio(dpr)
         px_s.fill(QColor(0, 0, 0, 0))
 
         def _apply_transform(p: QPainter) -> None:
@@ -614,12 +629,14 @@ class LyricsCanvas(QWidget):
             return
 
         W, H = self.width(), self.height()
+        dpr  = self.devicePixelRatioF()
 
-        # Invalidate all caches if window was resized
-        if self._cache_win_w != W or self._cache_win_h != H:
+        # Invalidate caches if logical size or DPI changed (e.g. moved to different monitor)
+        if self._cache_win_w != W or self._cache_win_h != H or self._cache_dpr != dpr:
             self._invalidate_pixmap_cache()
             self._cache_win_w = W
             self._cache_win_h = H
+            self._cache_dpr   = dpr
 
         # Lazily render the active line
         if self._px_unsung[li] is None:
@@ -630,7 +647,22 @@ class LyricsCanvas(QWidget):
         if nxt < len(self._px_unsung) and self._px_unsung[nxt] is None:
             self._render_line_to_cache(nxt)
 
-        sweep_x = self._get_sweep_x(li, ms)
+        target_x = self._get_sweep_x(li, ms)
+
+        # Exponential low-pass smoothing: reset on line change, catch-up when
+        # target is ahead (never let smoothed lag more than 40 px behind).
+        _ALPHA = 0.55   # high alpha = near-instant tracking; only smooths sub-frame jitter
+        if self._sweep_last_li != li:
+            self._sweep_smooth  = target_x
+            self._sweep_last_li = li
+        else:
+            diff = target_x - self._sweep_smooth
+            # Instant catch-up on seek / fast-forward
+            if diff > 20:
+                self._sweep_smooth = target_x
+            else:
+                self._sweep_smooth += diff * _ALPHA
+        sweep_x = self._sweep_smooth
 
         painter = QPainter(self)
         painter.setOpacity(self._fade_alpha)
@@ -660,7 +692,9 @@ class SettingsDialog(QDialog):
         if not self._on_preview:
             return
         self.font_size_jp.valueChanged.connect(self._preview)
+        self.font_size_rt.valueChanged.connect(self._preview)
         self.font_size_zh.valueChanged.connect(self._preview)
+        self.spacing_rt.valueChanged.connect(self._preview)
         self.spacing_zh.valueChanged.connect(self._preview)
         self.opacity.valueChanged.connect(self._preview)
         self.hide_pause.toggled.connect(self._preview)
@@ -681,15 +715,19 @@ class SettingsDialog(QDialog):
         self.font_jp_w    = self._font_row(self.cfg["font_jp"])
         self.font_zh_w    = self._font_row(self.cfg["font_zh"])
         self.font_size_jp = QSpinBox(); self.font_size_jp.setRange(8, 96); self.font_size_jp.setSuffix(" px"); self.font_size_jp.setValue(self.cfg["font_size_jp"])
+        self.font_size_rt = QSpinBox(); self.font_size_rt.setRange(6, 72); self.font_size_rt.setSuffix(" px"); self.font_size_rt.setValue(self.cfg.get("font_size_rt", max(8, self.cfg["font_size_jp"] // 2)))
         self.font_size_zh = QSpinBox(); self.font_size_zh.setRange(8, 96); self.font_size_zh.setSuffix(" px"); self.font_size_zh.setValue(self.cfg["font_size_zh"])
+        self.spacing_rt   = QSpinBox(); self.spacing_rt.setRange(-30, 60); self.spacing_rt.setSuffix(" px"); self.spacing_rt.setValue(self.cfg.get("spacing_rt", 2))
         self.spacing_zh   = QSpinBox(); self.spacing_zh.setRange(-60, 60); self.spacing_zh.setSuffix(" px"); self.spacing_zh.setValue(self.cfg["spacing_zh"])
+        # 設定画面の表示名は日本語で統一すること。
+        f1.addRow("振り仮名サイズ", self.font_size_rt)
+        f1.addRow("振り仮名と日本語の間隔", self.spacing_rt)
         f1.addRow("日本語フォント",      self.font_jp_w)
         f1.addRow("中国語フォント",         self.font_zh_w)
         f1.addRow("日本語フォントサイズ", self.font_size_jp)
         f1.addRow("中国語フォントサイズ",   self.font_size_zh)
         f1.addRow("日中間距(px)",         self.spacing_zh)
         tabs.addTab(w1, "表示")
-
         w2  = QWidget()
         f2  = QFormLayout(w2)
         self.btn_sung   = self._color_btn(self.cfg["color_sung"])
@@ -766,7 +804,9 @@ class SettingsDialog(QDialog):
             "font_jp":       self.font_jp_w._edit.text(),
             "font_zh":       self.font_zh_w._edit.text(),
             "font_size_jp":  self.font_size_jp.value(),
+            "font_size_rt":  self.font_size_rt.value(),
             "font_size_zh":  self.font_size_zh.value(),
+            "spacing_rt":    self.spacing_rt.value(),
             "spacing_zh":    self.spacing_zh.value(),
             "color_sung":    self.btn_sung._color,
             "color_unsung":  self.btn_unsung._color,
@@ -802,9 +842,12 @@ class _MouseOverlay(QWidget):
 
     def paintEvent(self, _):
         w = self._win
+        painter = QPainter(self)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 1))
+        painter.drawRect(self.rect())
         if not (w._hovering and not w._locked) and not w._zone_preview:
             return
-        painter = QPainter(self)
         if w._hovering and not w._locked:
             pen = QPen(QColor(255, 255, 255, 38))
             pen.setWidth(1)
