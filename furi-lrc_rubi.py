@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """furi-lrc — karaoke lyrics overlay for Windows 11
-PyQt6 QPainter · bilingual JP/ZH · furigana · mora-level karaoke sweep (native)
+Smooth GPU-blit edition: pre-rendered pixmap cache + soft-correction clock.
+
+Phase 2+3  Each active line is pre-rendered once into two QPixmap caches
+           (unsung layer + sung layer). paintEvent only blits + clips a
+           single rect — zero text shaping per frame.
+Phase 4    Self-walking monotonic clock. SMTC ticks apply soft 15%
+           correction for drift; hard sync fires only on play/pause
+           transitions or seek jumps > 700 ms.
+Phase 5    All heavy work (shadow parse, font metrics, color construction,
+           block geometry) is done at load/resize/config time, not in the
+           per-frame path. 60 fps timer suspends when paused & fully faded.
 """
 
 import sys
@@ -27,6 +37,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor, QCursor, QPainter, QPen, QFontDatabase, QFont, QFontMetricsF,
+    QPixmap,
 )
 
 # ── winrt SMTC (optional) ───
@@ -146,8 +157,8 @@ class SMTCWorker(QObject):
 
 @dataclasses.dataclass
 class _MoraDraw:
-    x:     float   # x offset from line's left edge (unscaled)
-    w:     float   # advance width (unscaled)
+    x:     float
+    w:     float
     text:  str
     s_ms:  float
     e_ms:  float
@@ -159,7 +170,7 @@ class _KanjiDraw:
     x:          float
     w:          float
     text:       str
-    mora_refs:  List[_MoraDraw]   # furigana morae for averaging progress
+    mora_refs:  List[_MoraDraw]
 
 
 @dataclasses.dataclass
@@ -181,14 +192,7 @@ def _mora_progress(m: _MoraDraw, ms: float) -> float:
     return _clamp01((ms - m.s_ms) / max(1.0, m.e_ms - m.s_ms))
 
 
-def _kanji_progress(k: _KanjiDraw, ms: float) -> float:
-    if not k.mora_refs:
-        return 0.0
-    return sum(_mora_progress(m, ms) for m in k.mora_refs) / len(k.mora_refs)
-
-
 def _parse_shadow(s: str) -> Optional[Tuple[float, float, QColor]]:
-    """Parse a CSS text-shadow value to (dx, dy, QColor) or None."""
     if not s or s.lower() == "none":
         return None
     nums = re.findall(r"-?\d+(?:\.\d+)?", s)
@@ -226,9 +230,13 @@ def _load_qt_font(path_str: str, size: int,
     return f
 
 
-# ── Native QPainter canvas ──
+# ── Lyrics canvas ──
 
 class LyricsCanvas(QWidget):
+    # Phase 4: soft-clock constants
+    _SOFT_RATE   = 0.15    # fraction of SMTC drift absorbed each poll tick
+    _HARD_THRESH = 700.0   # ms — jump larger than this → hard sync (seek)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -238,13 +246,24 @@ class LyricsCanvas(QWidget):
         self._lyrics:  list              = []
         self._layouts: List[_LineLayout] = []
 
+        # Phase 2+3: per-line pixmap caches (index-aligned with _layouts)
+        self._px_unsung:    List[Optional[QPixmap]]             = []
+        self._px_sung:      List[Optional[QPixmap]]             = []
+        self._sweep_params: List[Optional[Tuple[float, float]]] = []  # (x_off, scale)
+        self._cache_win_w:  int = 0
+        self._cache_win_h:  int = 0
+
+        # Phase 4: self-walking clock
         self._base_ms:    float = 0.0
         self._base_wall:  float = time.monotonic()
         self._playing:    bool  = False
-        self._active_i:   int   = -1
-        self._fade_alpha: float = 0.0
+
+        # Fade state
+        self._active_i:    int   = -1
+        self._fade_alpha:  float = 0.0
         self._fade_target: float = 1.0
 
+        # Fonts (rebuilt in apply_cfg / _rebuild_fonts)
         self._font_jp = QFont()
         self._font_rt = QFont()
         self._font_zh = QFont()
@@ -252,33 +271,61 @@ class LyricsCanvas(QWidget):
         self._fm_rt   = QFontMetricsF(self._font_rt)
         self._fm_zh   = QFontMetricsF(self._font_zh)
 
+        # Phase 5: 60fps timer; suspends when paused & fully faded
         self._frame_timer = QTimer(self)
         self._frame_timer.setInterval(16)
         self._frame_timer.timeout.connect(self._tick)
         self._frame_timer.start()
 
-    # ── Clock & state ──
+    # ── Phase 4: clock ──
 
-    def sync_time(self, sec: float, playing: bool) -> None:
-        self._base_ms   = sec * 1000.0
-        self._base_wall = time.monotonic()
-        self._playing   = playing
+    def sync_time(self, sec: float, playing: bool, force_hard: bool = False) -> None:
+        """Update canvas clock from an SMTC reading.
+
+        Soft-corrects small drift while self-walking; hard-syncs on
+        play/pause transitions, large jumps (seeks), or explicit force.
+        """
+        new_ms      = sec * 1000.0
+        was_playing = self._playing
+
+        hard = force_hard or (playing != was_playing) or not playing
+        if not hard:
+            delta = new_ms - self._now_ms()
+            if abs(delta) > self._HARD_THRESH:
+                hard = True
+            else:
+                # Soft correction: absorb a fraction of the drift
+                self._base_ms  += delta * self._SOFT_RATE
+                self._base_wall = time.monotonic()
+                self._playing   = playing
+                self.update()
+                return
+
+        if hard:
+            self._base_ms   = new_ms
+            self._base_wall = time.monotonic()
+            self._playing   = playing
+        self.update()
 
     def _now_ms(self) -> float:
         if self._playing:
             return self._base_ms + (time.monotonic() - self._base_wall) * 1000.0
         return self._base_ms
 
+    # ── Phase 5: suspend idle repaints ──
+
     def _tick(self) -> None:
-        step = 0.07   # ~240 ms to full opacity at 16 ms/frame
+        step = 0.07
         diff = self._fade_target - self._fade_alpha
         if abs(diff) < step:
             self._fade_alpha = self._fade_target
         else:
             self._fade_alpha += step if diff > 0 else -step
-        self.update()
+        # Skip repaint when paused and fade is stable — saves CPU + GPU
+        if self._playing or abs(self._fade_target - self._fade_alpha) >= step:
+            self.update()
 
-    # ── Config & font handling ──
+    # ── Config & fonts ──
 
     def apply_cfg(self, cfg: dict) -> None:
         prev = self._cfg
@@ -290,21 +337,30 @@ class LyricsCanvas(QWidget):
             cfg.get("font_size_zh") != prev.get("font_size_zh") or
             not prev
         )
+        visual_changed = (
+            cfg.get("color_sung")   != prev.get("color_sung")   or
+            cfg.get("color_unsung") != prev.get("color_unsung") or
+            cfg.get("color_zh")     != prev.get("color_zh")     or
+            cfg.get("text_shadow")  != prev.get("text_shadow")  or
+            cfg.get("spacing_zh")   != prev.get("spacing_zh")
+        )
         if font_changed:
             self._rebuild_fonts()
-            self._rebuild_layouts()
+            self._rebuild_layouts()        # also rebuilds pixmap list
+        elif visual_changed:
+            self._invalidate_pixmap_cache()
         self.update()
 
     def _rebuild_fonts(self) -> None:
-        cfg     = self._cfg
-        sz_jp   = cfg.get("font_size_jp", 20)
-        sz_rt   = max(8, sz_jp // 2)
-        sz_zh   = cfg.get("font_size_zh", 14)
-        jp_path = cfg.get("font_jp", "")
-        zh_path = cfg.get("font_zh", "")
-        self._font_jp = _load_qt_font(jp_path, sz_jp, QFont.Weight.DemiBold)
-        self._font_rt = _load_qt_font(jp_path, sz_rt, QFont.Weight.DemiBold)
-        self._font_zh = _load_qt_font(zh_path, sz_zh, QFont.Weight.Normal)
+        cfg   = self._cfg
+        sz_jp = cfg.get("font_size_jp", 20)
+        sz_rt = max(8, sz_jp // 2)
+        sz_zh = cfg.get("font_size_zh", 14)
+        jp_p  = cfg.get("font_jp", "")
+        zh_p  = cfg.get("font_zh", "")
+        self._font_jp = _load_qt_font(jp_p, sz_jp, QFont.Weight.DemiBold)
+        self._font_rt = _load_qt_font(jp_p, sz_rt, QFont.Weight.DemiBold)
+        self._font_zh = _load_qt_font(zh_p, sz_zh, QFont.Weight.Normal)
         self._fm_jp   = QFontMetricsF(self._font_jp)
         self._fm_rt   = QFontMetricsF(self._font_rt)
         self._fm_zh   = QFontMetricsF(self._font_zh)
@@ -312,7 +368,7 @@ class LyricsCanvas(QWidget):
     # ── Lyrics loading & layout ──
 
     def load_lyrics(self, lines: list) -> None:
-        self._lyrics   = lines
+        self._lyrics    = lines
         self._active_i  = -1
         self._fade_alpha = 0.0
         self._rebuild_layouts()
@@ -320,6 +376,9 @@ class LyricsCanvas(QWidget):
 
     def _rebuild_layouts(self) -> None:
         self._layouts = [self._layout_line(ln) for ln in self._lyrics]
+        self._invalidate_pixmap_cache()
+        self._cache_win_w = 0
+        self._cache_win_h = 0
 
     def _layout_line(self, line: dict) -> _LineLayout:
         segs    = line.get("jp", [])
@@ -335,11 +394,11 @@ class LyricsCanvas(QWidget):
         for seg in segs:
             units = seg.get("units", [])
             if seg.get("ruby"):
-                base  = seg.get("base", "")
-                furi  = "".join(u["k"] for u in units)
-                Wb    = fm_jp.horizontalAdvance(base)
-                Wr    = fm_rt.horizontalAdvance(furi)
-                Wc    = max(Wb, Wr)
+                base    = seg.get("base", "")
+                furi    = "".join(u["k"] for u in units)
+                Wb      = fm_jp.horizontalAdvance(base)
+                Wr      = fm_rt.horizontalAdvance(furi)
+                Wc      = max(Wb, Wr)
                 kanji_x = x + (Wc - Wb) / 2
                 furi_x  = x + (Wc - Wr) / 2
                 seg_morae: List[_MoraDraw] = []
@@ -365,49 +424,37 @@ class LyricsCanvas(QWidget):
         return _LineLayout(morae=morae, kanjis=kanjis,
                            zh_text=zh_text, zh_w=zh_w, total_w=x)
 
-    # ── Painting ──
+    # ── Phase 5: resize invalidates caches ──
 
-    def paintEvent(self, _) -> None:  # noqa: N802
-        if not self._lyrics or not self._layouts:
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-            if self._cfg:
-                painter.setFont(self._font_jp)
-            painter.setPen(QColor(136, 136, 136, 100))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                             "歌詞ファイルをドロップまたは右クリックで開く")
-            return
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._invalidate_pixmap_cache()
 
-        ms = self._now_ms()
+    def _invalidate_pixmap_cache(self) -> None:
+        n = len(self._layouts)
+        self._px_unsung    = [None] * n
+        self._px_sung      = [None] * n
+        self._sweep_params = [None] * n
 
-        # Find active line
-        li = -1
-        for i, ln in enumerate(self._lyrics):
-            if ln.get("start", 0) <= ms:
-                li = i
-            else:
-                break
+    # ── Phase 2+3: pre-render one line into two pixmaps ──
 
-        if li != self._active_i:
-            self._active_i   = li
-            self._fade_alpha  = 0.0
-            self._fade_target = 1.0
-
-        if li < 0 or li >= len(self._layouts):
-            return
-
+    def _render_line_to_cache(self, li: int) -> None:
+        """Render line li into px_unsung / px_sung. Called at most once per line
+        per (window size × cfg) combination — not per frame."""
         layout = self._layouts[li]
         cfg    = self._cfg
         W, H   = self.width(), self.height()
-        has_zh = bool(layout.zh_text)
+        if W <= 0 or H <= 0:
+            return
 
-        # ── y geometry (recomputed from current height each frame) ──
+        # ── Phase 5: geometry computed here, not in paintEvent ──
         fm_jp   = self._fm_jp
         fm_rt   = self._fm_rt
         fm_zh   = self._fm_zh
         rt_h    = fm_rt.ascent() + fm_rt.descent()
         gap     = 2.0
         spacing = float(cfg.get("spacing_zh", -8))
+        has_zh  = bool(layout.zh_text)
 
         if has_zh:
             block_h = (rt_h + gap + fm_jp.ascent() + fm_jp.descent()
@@ -421,7 +468,6 @@ class LyricsCanvas(QWidget):
         zh_base_y = (jp_base_y + fm_jp.descent() + spacing + fm_zh.ascent()
                      if has_zh else 0.0)
 
-        # ── horizontal: center + scale-down on overflow ──
         pad   = 18.0
         avail = W - 2 * pad
         scale = min(1.0, avail / layout.total_w) if layout.total_w > 1 else 1.0
@@ -432,63 +478,170 @@ class LyricsCanvas(QWidget):
         color_unsung = QColor(cfg.get("color_unsung", "#888888"))
         color_zh_c   = QColor(cfg.get("color_zh",     "#aaaaaa"))
 
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        painter.setOpacity(self._fade_alpha)
+        # ── Allocate two transparent pixmaps ──
+        px_u = QPixmap(W, H)
+        px_u.fill(QColor(0, 0, 0, 0))
+        px_s = QPixmap(W, H)
+        px_s.fill(QColor(0, 0, 0, 0))
 
-        # Two-pass draw for one unit: unsung fill, then clip to sung portion
-        def draw_unit(font: QFont, x: float, y: float, w: float, text: str, p: float) -> None:
-            if shadow:
-                dx, dy, sc = shadow
-                painter.setFont(font)
-                painter.setPen(sc)
-                painter.drawText(QPointF(x + dx, y + dy), text)
-            painter.setFont(font)
-            painter.setPen(color_unsung)
-            painter.drawText(QPointF(x, y), text)
-            if p > 0.0:
-                painter.save()
-                painter.setClipRect(QRectF(x, -1.0, w * p, float(H) / max(scale, 0.01) + 2.0))
-                painter.setPen(color_sung)
-                painter.drawText(QPointF(x, y), text)
-                painter.restore()
+        def _apply_transform(p: QPainter) -> None:
+            if scale < 1.0:
+                p.translate(x_off, H / 2.0 * (1.0 - scale))
+                p.scale(scale, scale)
+            else:
+                p.translate(x_off, 0.0)
 
-        # Uniform scale-down on overflow — preserves glyph aspect ratio
-        painter.save()
-        if scale < 1.0:
-            # Translate so the block stays vertically centred after uniform scale
-            painter.translate(x_off, H / 2.0 * (1.0 - scale))
-            painter.scale(scale, scale)
-        else:
-            painter.translate(x_off, 0.0)
+        # ── Unsung layer: shadow + all glyphs in unsung color + ZH ──
+        p_u = QPainter(px_u)
+        p_u.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p_u.save()
+        _apply_transform(p_u)
 
+        if shadow:
+            sdx, sdy, sc = shadow
+            p_u.setPen(sc)
+            for m in layout.morae:
+                p_u.setFont(self._font_rt if m.is_rt else self._font_jp)
+                y = rt_base_y if m.is_rt else jp_base_y
+                p_u.drawText(QPointF(m.x + sdx, y + sdy), m.text)
+            if layout.kanjis:
+                p_u.setFont(self._font_jp)
+                for k in layout.kanjis:
+                    p_u.drawText(QPointF(k.x + sdx, jp_base_y + sdy), k.text)
+
+        p_u.setPen(color_unsung)
         for m in layout.morae:
-            draw_unit(
-                self._font_rt if m.is_rt else self._font_jp,
-                m.x,
-                rt_base_y if m.is_rt else jp_base_y,
-                m.w,
-                m.text,
-                _mora_progress(m, ms),
-            )
+            p_u.setFont(self._font_rt if m.is_rt else self._font_jp)
+            p_u.drawText(QPointF(m.x, rt_base_y if m.is_rt else jp_base_y), m.text)
+        if layout.kanjis:
+            p_u.setFont(self._font_jp)
+            for k in layout.kanjis:
+                p_u.drawText(QPointF(k.x, jp_base_y), k.text)
 
-        for k in layout.kanjis:
-            draw_unit(self._font_jp, k.x, jp_base_y, k.w, k.text, _kanji_progress(k, ms))
+        p_u.restore()   # pop scale/translate before drawing ZH
 
-        painter.restore()
-
-        # ZH: centred horizontally, not scaled; y tracks the compressed JP block
         if has_zh:
             zh_x = (W - layout.zh_w) / 2
-            zh_y = H / 2.0 * (1.0 - scale) + zh_base_y * scale if scale < 1.0 else zh_base_y
+            zh_y = (H / 2.0 * (1.0 - scale) + zh_base_y * scale
+                    if scale < 1.0 else zh_base_y)
             if shadow:
-                dx, dy, sc = shadow
-                painter.setFont(self._font_zh)
-                painter.setPen(sc)
-                painter.drawText(QPointF(zh_x + dx, zh_y + dy), layout.zh_text)
-            painter.setFont(self._font_zh)
-            painter.setPen(color_zh_c)
-            painter.drawText(QPointF(zh_x, zh_y), layout.zh_text)
+                sdx, sdy, sc = shadow
+                p_u.setFont(self._font_zh)
+                p_u.setPen(sc)
+                p_u.drawText(QPointF(zh_x + sdx, zh_y + sdy), layout.zh_text)
+            p_u.setFont(self._font_zh)
+            p_u.setPen(color_zh_c)
+            p_u.drawText(QPointF(zh_x, zh_y), layout.zh_text)
+
+        p_u.end()
+
+        # ── Sung layer: all glyphs in sung color, no shadow, no ZH ──
+        p_s = QPainter(px_s)
+        p_s.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p_s.save()
+        _apply_transform(p_s)
+
+        p_s.setPen(color_sung)
+        for m in layout.morae:
+            p_s.setFont(self._font_rt if m.is_rt else self._font_jp)
+            p_s.drawText(QPointF(m.x, rt_base_y if m.is_rt else jp_base_y), m.text)
+        if layout.kanjis:
+            p_s.setFont(self._font_jp)
+            for k in layout.kanjis:
+                p_s.drawText(QPointF(k.x, jp_base_y), k.text)
+
+        p_s.restore()
+        p_s.end()
+
+        self._px_unsung[li]    = px_u
+        self._px_sung[li]      = px_s
+        self._sweep_params[li] = (x_off, scale)
+
+    def _get_sweep_x(self, li: int, ms: float) -> float:
+        """Return the karaoke reveal x in window pixel coordinates.
+
+        Defined as the rightmost edge of any mora whose progress > 0,
+        weighted by that mora's individual progress fraction.  Taking
+        the max across all morae (rt + plain) produces a smooth
+        left-to-right bar that is stable even when furigana x-ranges
+        are slightly wider than their kanji bases.
+        """
+        layout = self._layouts[li]
+        params = self._sweep_params[li]
+        if params is None:
+            return 0.0
+        x_off, scale = params
+
+        sweep_layout = 0.0
+        for m in layout.morae:
+            p = _mora_progress(m, ms)
+            if p > 0.0:
+                right = m.x + m.w * p
+                if right > sweep_layout:
+                    sweep_layout = right
+
+        return x_off + sweep_layout * scale
+
+    # ── Phase 3: two-layer blit paintEvent ──
+
+    def paintEvent(self, _) -> None:    # noqa: N802
+        if not self._lyrics or not self._layouts:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+            if self._cfg:
+                painter.setFont(self._font_jp)
+            painter.setPen(QColor(136, 136, 136, 100))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             "歌詞ファイルをドロップまたは右クリックで開く")
+            return
+
+        ms = self._now_ms()
+
+        # Find active line (last line whose start ≤ ms)
+        li = -1
+        for i, ln in enumerate(self._lyrics):
+            if ln.get("start", 0) <= ms:
+                li = i
+            else:
+                break
+
+        if li != self._active_i:
+            self._active_i    = li
+            self._fade_alpha  = 0.0
+            self._fade_target = 1.0
+
+        if li < 0 or li >= len(self._layouts):
+            return
+
+        W, H = self.width(), self.height()
+
+        # Invalidate all caches if window was resized
+        if self._cache_win_w != W or self._cache_win_h != H:
+            self._invalidate_pixmap_cache()
+            self._cache_win_w = W
+            self._cache_win_h = H
+
+        # Lazily render the active line
+        if self._px_unsung[li] is None:
+            self._render_line_to_cache(li)
+
+        # Pre-warm next line to avoid first-frame cost on line transition
+        nxt = li + 1
+        if nxt < len(self._px_unsung) and self._px_unsung[nxt] is None:
+            self._render_line_to_cache(nxt)
+
+        sweep_x = self._get_sweep_x(li, ms)
+
+        painter = QPainter(self)
+        painter.setOpacity(self._fade_alpha)
+
+        # Layer 1: full unsung pixmap (shadow + unsung text + ZH)
+        painter.drawPixmap(0, 0, self._px_unsung[li])
+
+        # Layer 2: sung pixmap clipped to the revealed left portion
+        if sweep_x > 0.0:
+            painter.setClipRect(QRectF(0.0, 0.0, sweep_x, float(H)))
+            painter.drawPixmap(0, 0, self._px_sung[li])
 
 
 # ── Settings dialog ────
@@ -523,7 +676,6 @@ class SettingsDialog(QDialog):
         tabs  = QTabWidget()
         outer.addWidget(tabs)
 
-        # ── Tab: 表示 ──
         w1  = QWidget()
         f1  = QFormLayout(w1)
         self.font_jp_w    = self._font_row(self.cfg["font_jp"])
@@ -538,7 +690,6 @@ class SettingsDialog(QDialog):
         f1.addRow("日中間距(px)",         self.spacing_zh)
         tabs.addTab(w1, "表示")
 
-        # ── Tab: 色彩 ──
         w2  = QWidget()
         f2  = QFormLayout(w2)
         self.btn_sung   = self._color_btn(self.cfg["color_sung"])
@@ -555,7 +706,6 @@ class SettingsDialog(QDialog):
         f2.addRow("テキストシャドウ", self.text_shadow)
         tabs.addTab(w2, "色彩")
 
-        # ── Tab: 動作 ──
         w3  = QWidget()
         f3  = QFormLayout(w3)
         self.hide_pause  = QCheckBox(); self.hide_pause.setChecked(self.cfg["hide_on_pause"])
@@ -683,7 +833,6 @@ class _MouseOverlay(QWidget):
 # ── Screen geometry helpers ──
 
 def _fit_to_screen(x: int, y: int, w: int, h: int) -> Tuple[int, int, int, int]:
-    """Clamp window position so at least KEEP px remain visible on some screen."""
     screens = QApplication.screens()
     if not screens:
         return x, y, w, h
@@ -699,7 +848,6 @@ def _fit_to_screen(x: int, y: int, w: int, h: int) -> Tuple[int, int, int, int]:
 
 
 def _screen_relative_defaults() -> dict:
-    """Return geometry dict sized relative to the primary screen."""
     screen = QApplication.primaryScreen()
     if not screen:
         return {}
@@ -739,8 +887,6 @@ class LyricWindow(QWidget):
         self._setup_zone_btn()
         self._setup_canvas()
         self._setup_smtc()
-        self._setup_timer()
-        self._setup_cursor_timer()
 
         if self.cfg["lyrics_path"]:
             self._load_lyrics(self.cfg["lyrics_path"])
@@ -835,18 +981,13 @@ class LyricWindow(QWidget):
         self._overlay = _MouseOverlay(self)
         self._overlay.setGeometry(0, 0, self.width(), self.height())
         self._zone_btn.raise_()
+        self._setup_cursor_timer()
 
     def _setup_smtc(self):
         self.smtc = SMTCWorker()
         self.smtc.time_updated.connect(self._on_time_updated)
         self.smtc.track_changed.connect(self._on_track_changed)
         self.smtc.start()
-
-    def _setup_timer(self):
-        self._timer = QTimer(self)
-        self._timer.setInterval(200)
-        self._timer.timeout.connect(self._push_sync)
-        self._timer.start()
 
     # ── Lyrics loading ──
 
@@ -865,11 +1006,14 @@ class LyricWindow(QWidget):
     # ── SMTC callbacks ──
 
     def _on_time_updated(self, sec: float, playing: bool):
-        was_playing      = self._is_playing
-        self._last_sec   = sec
-        self._last_wall  = time.monotonic()
+        was_playing     = self._is_playing
+        self._last_sec  = sec
+        self._last_wall = time.monotonic()
         self._is_playing = playing
-        self._push_sync()
+
+        # Phase 4: hard sync only on state transitions; soft-correct otherwise
+        force_hard = (playing != was_playing)
+        self.canvas.sync_time(sec, playing, force_hard=force_hard)
 
         if self.cfg["hide_on_pause"]:
             if playing and not was_playing:
@@ -885,13 +1029,6 @@ class LyricWindow(QWidget):
             if title.lower() in p.stem.lower():
                 self._load_lyrics(str(p))
                 return
-
-    def _push_sync(self):
-        if self._is_playing:
-            sec = self._last_sec + (time.monotonic() - self._last_wall)
-        else:
-            sec = self._last_sec
-        self.canvas.sync_time(sec, self._is_playing)
 
     # ── Animation ──
 
