@@ -2,4 +2,4 @@
 /__pycache__
 /.venv
 /.agents
-/.mp4
+*.mp4
