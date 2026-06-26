@@ -40,10 +40,10 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QStyledItemDelegate, QStyle, QStyleOptionViewItem,
     QSlider, QFrame, QSizePolicy,
-    QScrollArea, QTextEdit, QGroupBox, QMenu, QComboBox,
+    QScrollArea, QTextEdit, QGroupBox, QMenu, QComboBox, QLayout,
 )
 from PyQt6.QtCore import (
-    Qt, QTimer, QThread, pyqtSignal, QUrl, QSize,
+    Qt, QTimer, QThread, pyqtSignal, QUrl, QSize, QPoint, QRect,
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QPen, QBrush, QFont, QKeySequence, QShortcut,
@@ -89,8 +89,13 @@ def str_to_ms(text: str) -> Optional[int]:
 
 _RUBY_RE = re.compile(r'\{([^|{}]+)\|([^{}]+)\}')
 
+_BASE_DIR  = Path(__file__).parent
+_DIR_SONGS = _BASE_DIR / "songs"
+_DIR_FLRC  = _BASE_DIR / "flrc"
+
 # Populated in main() after QFontDatabase.addApplicationFont
 _NOTO_JP = ""  # NotoSansJP family name
+_MSYH_BD = ""  # Microsoft YaHei Bold family name (msyhbd.ttc)
 
 
 def parse_jp_markup(text: str, t_start: int = 0, t_end: int = 5000) -> list:
@@ -678,6 +683,73 @@ class TimeEdit(QLineEdit):
 #  Unit tap dialog
 # ══════════════════════════════════════════════════════════════
 
+class FlowLayout(QLayout):
+    """A small wrapping layout for the unit-tap character buttons."""
+
+    def __init__(self, parent=None, margin=0, spacing=4):
+        super().__init__(parent)
+        self._items = []
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        left, top, right, bottom = self.getContentsMargins()
+        return size + QSize(left + right, top + bottom)
+
+    def _do_layout(self, rect, test_only):
+        left, top, right, bottom = self.getContentsMargins()
+        effective = rect.adjusted(left, top, -right, -bottom)
+        x, y = effective.x(), effective.y()
+        line_height = 0
+        spacing = self.spacing()
+
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + spacing
+            if line_height and next_x - spacing > effective.right() + 1:
+                x = effective.x()
+                y += line_height + spacing
+                next_x = x + hint.width() + spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+
+        return y + line_height - rect.y() + bottom
+
+
 class UnitTapDialog(QDialog):
     """
     Re-time units by tapping Space in sync with slowed-down playback.
@@ -690,8 +762,8 @@ class UnitTapDialog(QDialog):
     Space N+2    → stamp end of unit[N-1] → playback pauses, done
     OK / Cancel  → confirm / discard
     """
-    _SPEEDS = [0.25, 0.5, 0.75, 1.0]
-    _SPEED_LABELS = ["0.25×", "0.5×", "0.75×", "1.0×"]
+    _SPEEDS = [0.1, 0.25, 0.5, 0.75, 1.0]
+    _SPEED_LABELS = ["0.1×", "0.25×", "0.5×", "0.75×", "1.0×"]
 
     def __init__(self, segs: list, line_start: int, line_end: int,
                  player, parent=None):
@@ -711,6 +783,7 @@ class UnitTapDialog(QDialog):
 
         self._flatten()
         self._build_ui()
+        self._fit_unit_area_to_contents()
 
     def _flatten(self):
         for si, seg in enumerate(self._segs):
@@ -728,7 +801,7 @@ class UnitTapDialog(QDialog):
         self._speed_combo = QComboBox()
         for lbl in self._SPEED_LABELS:
             self._speed_combo.addItem(lbl)
-        self._speed_combo.setCurrentIndex(0)   # default 0.25×
+        self._speed_combo.setCurrentIndex(1)   # default 0.25×
         self._speed_combo.setFixedWidth(90)
         speed_row.addWidget(self._speed_combo)
         speed_row.addStretch()
@@ -745,9 +818,7 @@ class UnitTapDialog(QDialog):
 
         # ── Unit buttons ──
         self._unit_frame = QWidget()
-        flow = QHBoxLayout(self._unit_frame)
-        flow.setSpacing(4)
-        flow.setContentsMargins(0, 0, 0, 0)
+        flow = FlowLayout(self._unit_frame, spacing=4)
         self._unit_btns: list = []
         for info in self._flat:
             btn = QPushButton(info['k'])
@@ -756,13 +827,22 @@ class UnitTapDialog(QDialog):
             btn.setEnabled(False)
             flow.addWidget(btn)
             self._unit_btns.append(btn)
-        flow.addStretch()
-        layout.addWidget(self._unit_frame)
+        self._unit_scroll = QScrollArea()
+        self._unit_scroll.setWidgetResizable(True)
+        self._unit_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._unit_scroll.setWidget(self._unit_frame)
+        self._unit_scroll.setMinimumHeight(54)
+        self._unit_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        # Use surplus dialog height for the wrapping button area.  The scroll
+        # bar remains a fallback for exceptionally long lyric lines.
+        layout.addWidget(self._unit_scroll, 1)
 
         # ── Tap button ──
         self._tap_btn = QPushButton("▶  再生開始  (Space)")
         self._tap_btn.setFixedHeight(52)
-        self._tap_btn.setFont(QFont("", 14))
+        self._tap_btn.setFont(QFont(_NOTO_JP or "", 14))
         self._tap_btn.setStyleSheet(
             "QPushButton{background:#2e8b4a;color:white;border-radius:6px;}"
             "QPushButton:hover{background:#39a85c;}"
@@ -785,6 +865,20 @@ class UnitTapDialog(QDialog):
         # Space shortcut (scoped to this dialog only)
         sc = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         sc.activated.connect(self._tap)
+
+    def _fit_unit_area_to_contents(self):
+        """Give the wrapping button area enough initial height when practical."""
+        button_pitch = 50  # 46 px button + 4 px flow-layout spacing
+        usable_width = max(button_pitch, self.width() - 40)
+        columns = max(1, usable_width // button_pitch)
+        rows = max(1, (len(self._flat) + columns - 1) // columns)
+        desired_area = rows * button_pitch + 8
+
+        # Avoid opening an excessively tall dialog for unusually long lyrics;
+        # those still remain accessible via the vertical scrollbar.
+        base_height = 300
+        target_height = min(800, max(self.height(), base_height + desired_area))
+        self.resize(self.width(), target_height)
 
     def _get_speed(self) -> float:
         return self._SPEEDS[self._speed_combo.currentIndex()]
@@ -891,6 +985,29 @@ class UnitTapDialog(QDialog):
 
 
 # ══════════════════════════════════════════════════════════════
+#  JP text edit (Enter → parse, Shift/Ctrl+Enter → newline)
+# ══════════════════════════════════════════════════════════════
+
+class JpTextEdit(QTextEdit):
+    """
+    QTextEdit that fires apply_requested on bare Enter,
+    and inserts a real newline on Shift+Enter or Ctrl+Enter.
+    """
+    apply_requested = pyqtSignal()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if e.modifiers() & (Qt.KeyboardModifier.ShiftModifier |
+                                Qt.KeyboardModifier.ControlModifier):
+                # Insert literal newline
+                self.insertPlainText("\n")
+            else:
+                self.apply_requested.emit()
+            return
+        super().keyPressEvent(e)
+
+
+# ══════════════════════════════════════════════════════════════
 #  Line editor (right panel)
 # ══════════════════════════════════════════════════════════════
 
@@ -969,13 +1086,14 @@ class LineEditor(QWidget):
         apply_jp_btn.setFixedHeight(28)
         jp_head.addWidget(apply_jp_btn)
         jp_lay.addLayout(jp_head)
-        self._jp_edit = QTextEdit()
+        self._jp_edit = JpTextEdit()
         self._jp_edit.setFixedHeight(54)
-        self._jp_edit.setPlaceholderText("{東京|とうきょう}へ{行|い}く")
+        self._jp_edit.setPlaceholderText("{東京|とうきょう}へ{行|い}く  (Enter で JP 解析 / Shift+Enter で改行)")
         self._jp_edit.setFont(QFont(_NOTO_JP or "", 13))
         self._jp_edit.setAcceptRichText(False)
         self._jp_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._jp_edit.customContextMenuRequested.connect(self._jp_context_menu)
+        self._jp_edit.apply_requested.connect(self._apply_jp)
         jp_lay.addWidget(self._jp_edit)
 
         # Ctrl+R shortcut for ruby annotation
@@ -1714,6 +1832,412 @@ class AudioControlBar(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════
+#  Replace Dialog
+# ══════════════════════════════════════════════════════════════
+
+class ReplaceDialog(QDialog):
+    """
+    全文置換ダイアログ。
+
+    対象フィールド
+    --------------
+    ・JP（日本語ルビ読み）   → セグメントの units[].k / seg['base']
+    ・ZH（中文訳）           → line['zh']
+    ・両方
+
+    オプション
+    ----------
+    ・大文字/小文字を区別する
+    ・正規表現モード
+    ・置換対象フィールドの選択（JP / ZH / 両方）
+    """
+
+    replaced = pyqtSignal(int)   # 置換件数を通知
+
+    def __init__(self, get_lines_fn, push_undo_fn, refresh_fn, parent=None):
+        super().__init__(parent)
+        self._get_lines = get_lines_fn
+        self._push_undo = push_undo_fn
+        self._refresh = refresh_fn
+        self.setWindowTitle("置換")
+        self.setModal(False)
+        self.resize(520, 310)
+        self._history_find: list = []
+        self._history_replace: list = []
+        self._build_ui()
+        self.replaced.connect(self._on_replaced)
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # ── 検索文字列 ──
+        find_row = QHBoxLayout()
+        find_row.addWidget(QLabel("検索:"))
+        self._find_combo = QComboBox()
+        self._find_combo.setEditable(True)
+        self._find_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._find_combo.setMinimumWidth(320)
+        self._find_combo.lineEdit().setPlaceholderText("検索する文字列を入力")
+        self._find_combo.lineEdit().returnPressed.connect(self._replace_next)
+        find_row.addWidget(self._find_combo, 1)
+        layout.addLayout(find_row)
+
+        # ── 置換後文字列 ──
+        rep_row = QHBoxLayout()
+        rep_row.addWidget(QLabel("置換後:"))
+        self._rep_combo = QComboBox()
+        self._rep_combo.setEditable(True)
+        self._rep_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._rep_combo.setMinimumWidth(320)
+        self._rep_combo.lineEdit().setPlaceholderText("置換後の文字列を入力（空欄で削除）")
+        self._rep_combo.lineEdit().returnPressed.connect(self._replace_next)
+        rep_row.addWidget(self._rep_combo, 1)
+        layout.addLayout(rep_row)
+
+        # ── オプション ──
+        opt_box = QGroupBox("オプション")
+        opt_lay = QHBoxLayout(opt_box)
+        opt_lay.setSpacing(16)
+
+        self._chk_case = _mk_check("大文字/小文字を区別", False)
+        self._chk_regex = _mk_check("正規表現", False)
+        opt_lay.addWidget(self._chk_case)
+        opt_lay.addWidget(self._chk_regex)
+        opt_lay.addSpacing(24)
+
+        opt_lay.addWidget(QLabel("対象:"))
+        self._field_combo = QComboBox()
+        self._field_combo.addItems(["JP（日本語）", "ZH（中文訳）", "JP + ZH 両方"])
+        self._field_combo.setFixedWidth(160)
+        opt_lay.addWidget(self._field_combo)
+        opt_lay.addStretch()
+        layout.addWidget(opt_box)
+
+        # ── ステータス ──
+        self._status_lbl = QLabel("検索文字列を入力してください")
+        self._status_lbl.setStyleSheet("color:#555;font-size:11px;")
+        layout.addWidget(self._status_lbl)
+
+        # ── ボタン行 ──
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self._btn_prev = QPushButton("◀ 前へ")
+        self._btn_prev.setToolTip("前の一致箇所へ移動 (Shift+Enter)")
+        self._btn_prev.clicked.connect(self._replace_prev)
+        btn_row.addWidget(self._btn_prev)
+
+        self._btn_next = QPushButton("次へ ▶")
+        self._btn_next.setDefault(True)
+        self._btn_next.setToolTip("次の一致箇所を置換して進む (Enter)")
+        self._btn_next.clicked.connect(self._replace_next)
+        btn_row.addWidget(self._btn_next)
+
+        self._btn_all = QPushButton("すべて置換")
+        self._btn_all.setStyleSheet(
+            "QPushButton{background:#2e6fa0;color:white;border-radius:4px;}"
+            "QPushButton:hover{background:#3a88c0;}"
+        )
+        self._btn_all.setToolTip("条件に一致するすべての箇所を置換")
+        self._btn_all.clicked.connect(self._replace_all)
+        btn_row.addWidget(self._btn_all)
+
+        self._btn_count = QPushButton("件数確認")
+        self._btn_count.setToolTip("置換せず一致件数のみを表示")
+        self._btn_count.clicked.connect(self._count_matches)
+        btn_row.addWidget(self._btn_count)
+
+        btn_row.addStretch()
+
+        btn_close = QPushButton("閉じる")
+        btn_close.clicked.connect(self.close)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        # Shift+Enter = 前へ
+        sc_prev = QShortcut(QKeySequence("Shift+Return"), self)
+        sc_prev.activated.connect(self._replace_prev)
+
+    # ── 内部ヘルパー ──
+
+    def _find_text(self) -> str:
+        return self._find_combo.currentText()
+
+    def _rep_text(self) -> str:
+        return self._rep_combo.currentText()
+
+    def _push_find_history(self, text: str):
+        if text and text not in self._history_find:
+            self._history_find.insert(0, text)
+            self._history_find = self._history_find[:20]
+            self._find_combo.clear()
+            self._find_combo.addItems(self._history_find)
+            self._find_combo.setCurrentText(text)
+
+    def _push_rep_history(self, text: str):
+        if text not in self._history_replace:
+            self._history_replace.insert(0, text)
+            self._history_replace = self._history_replace[:20]
+            self._rep_combo.clear()
+            self._rep_combo.addItems(self._history_replace)
+            self._rep_combo.setCurrentText(text)
+
+    def _make_pattern(self, find: str):
+        """検索パターンを返す。失敗時は None。"""
+        flags = 0 if self._chk_case.isChecked() else re.IGNORECASE
+        if self._chk_regex.isChecked():
+            try:
+                return re.compile(find, flags)
+            except re.error as e:
+                self._status_lbl.setText(f"正規表現エラー: {e}")
+                self._status_lbl.setStyleSheet("color:red;font-size:11px;")
+                return None
+        else:
+            return re.compile(re.escape(find), flags)
+
+    def _field_mode(self) -> str:
+        idx = self._field_combo.currentIndex()
+        return ("jp", "zh", "both")[idx]
+
+    def _iter_strings(self, lines: list):
+        """
+        Yield (line_idx, field, getter, setter) tuples for each replaceable string.
+        getter() → current string
+        setter(new_str) → write back
+        """
+        mode = self._field_mode()
+        for li, line in enumerate(lines):
+            if mode in ("jp", "both"):
+                # JP: read/write the markup string through the segment structure
+                def _get_jp(line=line):
+                    return segments_to_markup(line.get('jp', []))
+
+                def _set_jp(s, line=line, li=li):
+                    t_start = line['start']
+                    t_end = line_end_ms(lines, li)
+                    new_segs = parse_jp_markup(s, t_start, t_end)
+                    merged = merge_jp_timing(line.get('jp', []), new_segs, t_start, t_end)
+                    line['jp'] = merged
+
+                yield (li, 'jp', _get_jp, _set_jp)
+
+            if mode in ("zh", "both"):
+                def _get_zh(line=line):
+                    return line.get('zh', '')
+
+                def _set_zh(s, line=line):
+                    line['zh'] = s
+
+                yield (li, 'zh', _get_zh, _set_zh)
+
+    def _count_matches(self):
+        find = self._find_text()
+        if not find:
+            self._status_lbl.setText("検索文字列を入力してください")
+            self._status_lbl.setStyleSheet("color:#555;font-size:11px;")
+            return
+        pat = self._make_pattern(find)
+        if pat is None:
+            return
+        lines = self._get_lines()
+        total = sum(
+            len(pat.findall(getter()))
+            for _, _, getter, _ in self._iter_strings(lines)
+        )
+        self._status_lbl.setText(f"一致件数: {total} 件")
+        self._status_lbl.setStyleSheet(
+            "color:#1a6aaa;font-size:11px;font-weight:bold;"
+        )
+
+    def _replace_all(self):
+        find = self._find_text()
+        if not find:
+            self._status_lbl.setText("検索文字列を入力してください")
+            self._status_lbl.setStyleSheet("color:#555;font-size:11px;")
+            return
+        pat = self._make_pattern(find)
+        if pat is None:
+            return
+        rep = self._rep_text()
+        lines = self._get_lines()
+        # Check if anything matches first
+        total_before = sum(
+            len(pat.findall(getter()))
+            for _, _, getter, _ in self._iter_strings(lines)
+        )
+        if total_before == 0:
+            self._status_lbl.setText("一致する箇所が見つかりませんでした")
+            self._status_lbl.setStyleSheet("color:#888;font-size:11px;")
+            return
+        self._push_undo()
+        self._push_find_history(find)
+        self._push_rep_history(rep)
+        count = 0
+        for _, _, getter, setter in self._iter_strings(lines):
+            original = getter()
+            new_str, n = pat.subn(rep, original)
+            if n:
+                setter(new_str)
+                count += n
+        self._refresh()
+        self.replaced.emit(count)
+
+    def _replace_next(self):
+        self._step_replace(forward=True)
+
+    def _replace_prev(self):
+        self._step_replace(forward=False)
+
+    def _step_replace(self, forward: bool):
+        find = self._find_text()
+        if not find:
+            self._status_lbl.setText("検索文字列を入力してください")
+            self._status_lbl.setStyleSheet("color:#555;font-size:11px;")
+            return
+        pat = self._make_pattern(find)
+        if pat is None:
+            return
+        rep = self._rep_text()
+        lines = self._get_lines()
+        items = list(self._iter_strings(lines))
+        if not forward:
+            items = list(reversed(items))
+
+        found_any = False
+        for _, _, getter, setter in items:
+            original = getter()
+            if pat.search(original):
+                found_any = True
+                self._push_undo()
+                self._push_find_history(find)
+                self._push_rep_history(rep)
+                new_str = pat.sub(rep, original, count=1)
+                setter(new_str)
+                self._refresh()
+                self.replaced.emit(1)
+                return
+
+        if not found_any:
+            self._status_lbl.setText("一致する箇所が見つかりませんでした")
+            self._status_lbl.setStyleSheet("color:#888;font-size:11px;")
+
+    def _on_replaced(self, count: int):
+        self._status_lbl.setText(f"✔ {count} 件を置換しました")
+        self._status_lbl.setStyleSheet("color:#1a8033;font-size:11px;font-weight:bold;")
+
+
+def _mk_check(label: str, checked: bool):
+    from PyQt6.QtWidgets import QCheckBox
+    cb = QCheckBox(label)
+    cb.setChecked(checked)
+    return cb
+
+
+# ══════════════════════════════════════════════════════════════
+#  Batch Translate Dialog
+# ══════════════════════════════════════════════════════════════
+
+class BatchTranslateDialog(QDialog):
+    """
+    一括翻訳編集ダイアログ。
+
+    左列: 日本語原文（読み取り専用）
+    右列: 中文訳（直接入力可）
+
+    OK で確定、キャンセル時は未保存変更があれば確認を求める。
+    """
+
+    def __init__(self, lines: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("一括翻訳編集")
+        self.setModal(True)
+        self.resize(760, 520)
+        # Deep-copy so edits are isolated until OK is pressed
+        self._lines = lines
+        self._result: Optional[list] = None   # set to edited zh list on accept
+        self._dirty = False
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        hint = QLabel("左列: 日本語原文（編集不可）　右列: 中文訳（直接入力）")
+        hint.setStyleSheet("color:#555;font-size:11px;")
+        layout.addWidget(hint)
+
+        self._table = QTableWidget(len(self._lines), 2)
+        self._table.setHorizontalHeaderLabels(["日本語 (JP)", "中文訳 (ZH)"])
+        self._table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self._table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setAlternatingRowColors(True)
+        self._table.verticalHeader().setDefaultSectionSize(30)
+
+        jp_font = QFont(_NOTO_JP or "", 12)
+        zh_font = QFont("Microsoft YaHei", 12)
+
+        for row, line in enumerate(self._lines):
+            jp_text = segments_to_display_text(line.get('jp', []))
+            jp_item = QTableWidgetItem(jp_text)
+            jp_item.setFlags(jp_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            jp_item.setForeground(QColor("#444"))
+            jp_item.setFont(jp_font)
+            jp_item.setToolTip(jp_text)
+            self._table.setItem(row, 0, jp_item)
+
+            zh_item = QTableWidgetItem(line.get('zh', ''))
+            zh_item.setFont(zh_font)
+            self._table.setItem(row, 1, zh_item)
+
+        self._table.itemChanged.connect(self._on_cell_changed)
+        layout.addWidget(self._table, 1)
+
+        # Button row
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self._on_cancel)
+        layout.addWidget(bb)
+
+        # Tab moves between ZH cells only
+        self._table.setTabKeyNavigation(True)
+
+    def _on_cell_changed(self, item: QTableWidgetItem):
+        if item.column() == 1:
+            self._dirty = True
+
+    def _accept(self):
+        self._result = [
+            self._table.item(row, 1).text() if self._table.item(row, 1) else ''
+            for row in range(len(self._lines))
+        ]
+        self.accept()
+
+    def _on_cancel(self):
+        if self._dirty:
+            r = QMessageBox.question(
+                self,
+                "キャンセルの確認",
+                "編集内容が保存されていません。\nキャンセルして変更を破棄しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        self.reject()
+
+    def result_zh(self) -> Optional[list]:
+        """Returns list of zh strings in line order, or None if cancelled."""
+        return self._result
+
+
+# ══════════════════════════════════════════════════════════════
 #  Main Window
 # ══════════════════════════════════════════════════════════════
 
@@ -1741,6 +2265,7 @@ class MainWindow(QMainWindow):
         self._wf_loader: Optional[WaveformLoader] = None
         self._pending_wf_zoom: Optional[float] = None
         self._pending_wf_scroll: Optional[float] = None
+        self._replace_dialog: Optional[ReplaceDialog] = None
 
         self._build_ui()
         self._build_shortcuts()
@@ -1851,7 +2376,7 @@ class MainWindow(QMainWindow):
 
         _act_open = QAction("開く…", self)
         _act_open.setShortcut(QKeySequence("Ctrl+O"))
-        _act_open.setToolTip("プロジェクト (.flproj) または歌詞 JSON (.json) を開く")
+        _act_open.setToolTip("プロジェクト (.flproj) または歌詞 (.flrc) を開く")
         _act_open.triggered.connect(self._open_json)
         _fm.addAction(_act_open)
 
@@ -1879,10 +2404,31 @@ class MainWindow(QMainWindow):
         _act_lrc_out.triggered.connect(self._export_lrc)
         _fm.addAction(_act_lrc_out)
 
-        _act_json_out = QAction("歌詞 JSON として書出…", self)
-        _act_json_out.setToolTip("現在の歌詞データを純粋な JSON ファイルに書き出す")
+        _act_json_out = QAction("歌詞 FLRC として書出…", self)
+        _act_json_out.setToolTip("現在の歌詞データを FLRC ファイルに書き出す")
         _act_json_out.triggered.connect(self._export_json)
         _fm.addAction(_act_json_out)
+
+        # ── 編集メニュー ──
+        _em = mb.addMenu("編集")
+        _act_replace = QAction("置換…", self)
+        _act_replace.setShortcut(QKeySequence("Ctrl+H"))
+        _act_replace.setToolTip("全文置換ダイアログを開く (Ctrl+H)")
+        _act_replace.triggered.connect(self._open_replace_dialog)
+        _em.addAction(_act_replace)
+
+        _act_converge = QAction("収束…", self)
+        _act_converge.setToolTip(
+            "最後のユニットの終了時間が次の行の開始時間を超えている箇所を修正する"
+        )
+        _act_converge.triggered.connect(self._converge_last_units)
+        _em.addAction(_act_converge)
+
+        _act_batch_zh = QAction("一括翻訳編集…", self)
+        _act_batch_zh.setShortcut(QKeySequence("Ctrl+T"))
+        _act_batch_zh.setToolTip("全行の中文訳をまとめて編集する (Ctrl+T)")
+        _act_batch_zh.triggered.connect(self._open_batch_translate_dialog)
+        _em.addAction(_act_batch_zh)
 
         _wm = mb.addMenu("ウィンドウ")
         _scale_menu = _wm.addMenu("表示倍率")
@@ -2069,7 +2615,7 @@ class MainWindow(QMainWindow):
 
     def _open_mp3(self):
         path, _ = self._open_file_dialog(
-            self, "MP3ファイルを開く", "",
+            self, "MP3ファイルを開く", str(_DIR_SONGS),
             "Audio Files (*.mp3 *.m4a *.ogg *.wav *.flac);;All Files (*)"
         )
         if not path:
@@ -2118,8 +2664,8 @@ class MainWindow(QMainWindow):
             if not self._confirm_discard():
                 return
         path, _ = self._open_file_dialog(
-            self, "ファイルを開く", self._save_path or "",
-            "プロジェクト・歌詞 (*.flproj *.json);;プロジェクト (*.flproj);;JSON歌詞 (*.json);;All Files (*)"
+            self, "ファイルを開く", self._save_path or str(_DIR_FLRC),
+            "プロジェクト・歌詞 (*.flproj *.flrc);;プロジェクト (*.flproj);;FLRC歌詞 (*.flrc);;All Files (*)"
         )
         if path:
             if path.lower().endswith('.flproj'):
@@ -2156,10 +2702,10 @@ class MainWindow(QMainWindow):
         default = self._save_path or "project.flproj"
         path, _ = self._save_file_dialog(
             self, "名前を付けて保存", default,
-            "プロジェクト (*.flproj);;JSON歌詞 (*.json);;All Files (*)"
+            "プロジェクト (*.flproj);;FLRC歌詞 (*.flrc);;All Files (*)"
         )
         if path:
-            if not (path.lower().endswith('.flproj') or path.lower().endswith('.json')):
+            if not (path.lower().endswith('.flproj') or path.lower().endswith('.flrc')):
                 path += '.flproj'
             self._save_path = path
             self._write(path)
@@ -2168,9 +2714,9 @@ class MainWindow(QMainWindow):
         if path.lower().endswith('.flproj'):
             self._write_project(path)
         else:
-            self._write_json(path)
+            self._write_flrc(path)
 
-    def _write_json(self, path: str):
+    def _write_flrc(self, path: str):
         try:
             data = {"lines": self._lines}
             Path(path).write_text(
@@ -2578,7 +3124,7 @@ class MainWindow(QMainWindow):
             self._redo_stack.clear()
             self._refresh_all()
             self.setWindowTitle(
-                f"furi-lrc-gui — {Path(path).stem}.json (LRCから変換)"
+                f"furi-lrc-gui — {Path(path).stem}.flrc (LRCから変換)"
             )
             self._status.showMessage(
                 f"LRCインポート完了: {Path(path).name}  ({len(lines)} 行)"
@@ -2611,29 +3157,171 @@ class MainWindow(QMainWindow):
 
     def _export_json(self):
         if not self._lines:
-            QMessageBox.warning(self, "JSON書出", "歌詞データが空です。")
+            QMessageBox.warning(self, "FLRC書出", "歌詞データが空です。")
             return
         stem = Path(self._save_path).stem if self._save_path else "lyrics"
-        # Strip .flproj suffix so default name is clean
         if stem.lower().endswith('.flproj'):
             stem = stem[:-7]
-        default_name = stem + ".json"
+        default_name = str(_DIR_FLRC / (stem + ".flrc"))
         path, _ = self._save_file_dialog(
-            self, "歌詞 JSON として保存", default_name,
-            "JSON Files (*.json);;All Files (*)"
+            self, "FLRC歌詞として保存", default_name,
+            "FLRC Files (*.flrc);;All Files (*)"
         )
         if not path:
             return
-        if not path.lower().endswith('.json'):
-            path += '.json'
+        if not path.lower().endswith('.flrc'):
+            path += '.flrc'
         try:
             Path(path).write_text(
                 json.dumps({"lines": self._lines}, ensure_ascii=False, indent=2),
                 'utf-8'
             )
-            self._status.showMessage(f"JSON書出完了: {path}")
+            self._status.showMessage(f"FLRC書出完了: {path}")
         except Exception as e:
-            QMessageBox.critical(self, "JSON書出エラー", str(e))
+            QMessageBox.critical(self, "FLRC書出エラー", str(e))
+
+    # ─── converge last units ───
+
+    def _converge_last_units(self):
+        """
+        収束: 各行の最後のユニットの終了時間 (e) が次の行の開始時間を超えている
+        場合、その e を次の行の開始時間に揃える。
+
+        条件:
+          last_unit['s'] < next_line['start']   (最後拍の開始 < 次行開始)
+          last_unit['e'] > next_line['start']   (最後拍の終了 > 次行開始)
+        """
+        if not self._lines:
+            QMessageBox.information(self, "収束", "歌詞データが空です。")
+            return
+
+        # ── スキャンフェーズ ──
+        candidates: list = []   # (line_idx, last_unit_ref, old_e, new_e)
+        for i in range(len(self._lines) - 1):
+            line = self._lines[i]
+            next_start = self._lines[i + 1]['start']
+            segs = line.get('jp', [])
+            # Find the very last unit across all segments
+            last_unit = None
+            for seg in segs:
+                units = seg.get('units', [])
+                if units:
+                    last_unit = units[-1]
+            if last_unit is None:
+                continue
+            if last_unit['s'] < next_start and last_unit['e'] > next_start:
+                candidates.append((i, last_unit, last_unit['e'], next_start))
+
+        count = len(candidates)
+        if count == 0:
+            QMessageBox.information(
+                self, "収束",
+                "修正が必要な箇所は見つかりませんでした。"
+            )
+            return
+
+        # ── 確認ダイアログ ──
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("収束")
+        confirm.setText(
+            f"{count} 箇所で最後のユニットの終了時間が次の行の開始時間を超えています。\n"
+            "これらを次の行の開始時間に揃えますか？"
+        )
+        confirm.setStandardButtons(
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+        )
+        confirm.setDefaultButton(QMessageBox.StandardButton.Ok)
+        if confirm.exec() != QMessageBox.StandardButton.Ok:
+            return
+
+        # ── 適用 ──
+        self._push_undo()
+        details: list = []
+        for line_idx, unit_ref, old_e, new_e in candidates:
+            unit_ref['e'] = new_e
+            line = self._lines[line_idx]
+            char = unit_ref.get('k', '?')
+            details.append(
+                f"  行 {line_idx + 1}  「{char}」  {old_e} ms → {new_e} ms"
+            )
+        self._dirty = True
+        self._refresh_all(preserve_sel=True)
+
+        # ── 結果ダイアログ (保留 / 撤銷) ──
+        result_dlg = QDialog(self)
+        result_dlg.setWindowTitle("収束 — 結果")
+        result_dlg.setModal(True)
+        result_dlg.resize(480, 300)
+        vlay = QVBoxLayout(result_dlg)
+        vlay.setSpacing(8)
+
+        summary = QLabel(f"✔ {count} 箇所を修正しました:")
+        summary.setStyleSheet("font-weight:bold;")
+        vlay.addWidget(summary)
+
+        detail_edit = QTextEdit()
+        detail_edit.setReadOnly(True)
+        detail_edit.setPlainText("\n".join(details))
+        detail_edit.setFont(QFont("Consolas", 9))
+        vlay.addWidget(detail_edit, 1)
+
+        btn_row = QHBoxLayout()
+        btn_keep = QPushButton("保留（変更を確定）")
+        btn_keep.setDefault(True)
+        btn_keep.setStyleSheet(
+            "QPushButton{background:#2e8b4a;color:white;border-radius:4px;}"
+            "QPushButton:hover{background:#39a85c;}"
+        )
+        btn_undo = QPushButton("撤銷（変更を元に戻す）")
+        btn_undo.setStyleSheet(
+            "QPushButton{background:#c0392b;color:white;border-radius:4px;}"
+            "QPushButton:hover{background:#d9534f;}"
+        )
+        btn_row.addWidget(btn_keep)
+        btn_row.addWidget(btn_undo)
+        vlay.addLayout(btn_row)
+
+        def _keep():
+            result_dlg.accept()
+            self._status.showMessage(f"収束: {count} 箇所を修正しました")
+
+        def _revert():
+            self._undo()
+            result_dlg.reject()
+            self._status.showMessage("収束: 変更を元に戻しました")
+
+        btn_keep.clicked.connect(_keep)
+        btn_undo.clicked.connect(_revert)
+        result_dlg.exec()
+
+    # ─── replace dialog ───
+
+    def _open_batch_translate_dialog(self):
+        if not self._lines:
+            QMessageBox.information(self, "一括翻訳編集", "歌詞データが空です。")
+            return
+        dlg = BatchTranslateDialog(self._lines, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            zh_list = dlg.result_zh()
+            if zh_list is not None:
+                self._push_undo()
+                for i, zh in enumerate(zh_list):
+                    if i < len(self._lines):
+                        self._lines[i]['zh'] = zh
+                self._refresh_all(preserve_sel=True)
+                self._status.showMessage("一括翻訳編集を保存しました")
+
+    def _open_replace_dialog(self):
+        if self._replace_dialog is None or not self._replace_dialog.isVisible():
+            self._replace_dialog = ReplaceDialog(
+                get_lines_fn=lambda: self._lines,
+                push_undo_fn=self._push_undo,
+                refresh_fn=lambda: self._refresh_all(preserve_sel=True),
+                parent=self,
+            )
+        self._replace_dialog.show()
+        self._replace_dialog.raise_()
+        self._replace_dialog.activateWindow()
 
     # ─── close ───
 
@@ -2682,14 +3370,28 @@ def main():
     app.setApplicationName("furi-lrc-gui")
     app.setStyle("Fusion")
 
+    # ── Application / taskbar icon ──
+    _icon_path = _BASE_DIR / "icon-i.ico"
+    if not _icon_path.exists():
+        _icon_path = _BASE_DIR / "icon-i.png"
+    app.setWindowIcon(QIcon(str(_icon_path)))
+
     # ── Load UI font: NotoSansJP ──
-    _font_path = str(Path(__file__).parent / "fonts" / "NotoSansJP-Regular.ttf")
+    _font_path = str(_BASE_DIR / "fonts" / "NotoSansJP-Regular.ttf")
     _fid = QFontDatabase.addApplicationFont(_font_path)
     _families = QFontDatabase.applicationFontFamilies(_fid)
     if _families:
         global _NOTO_JP
         _NOTO_JP = _families[0]
         app.setFont(QFont(_NOTO_JP, 10))
+
+    # ── Load UI font: Microsoft YaHei Bold ──
+    _msyh_path = str(_BASE_DIR / "fonts" / "msyhbd.ttc")
+    _msyh_fid = QFontDatabase.addApplicationFont(_msyh_path)
+    _msyh_families = QFontDatabase.applicationFontFamilies(_msyh_fid)
+    if _msyh_families:
+        global _MSYH_BD
+        _MSYH_BD = _msyh_families[0]
 
     # ── Light (day) palette ──
     pal = QPalette()

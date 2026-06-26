@@ -12,37 +12,40 @@ echo.
 
 if not exist "furi-lrc-player.py" (
     echo ERROR: furi-lrc-player.py was not found in this folder.
-    echo Please run this script from the project folder.
     pause
     exit /b 1
 )
 
+if exist ".venv\Scripts\python.exe" (
+    set "PYTHON=.venv\Scripts\python.exe"
+    echo Using venv: .venv\Scripts\python.exe
+    goto :python_ok
+)
+
 where conda >nul 2>nul
 if errorlevel 1 (
-    echo ERROR: Conda was not found.
-    echo Please install Anaconda or Miniconda, or add conda to PATH.
+    echo ERROR: Neither venv nor Conda was found.
     pause
     exit /b 1
 )
 
 set "PYTHON=conda run -n rubi python"
 
-echo Using Conda environment:
-echo   rubi
+echo Using Conda environment: rubi
 %PYTHON% --version
 if errorlevel 1 (
     echo ERROR: Conda environment "rubi" could not be started.
-    echo Please create it first or check that the environment name is correct.
     pause
     exit /b 1
 )
+
+:python_ok
 echo.
 
 echo Checking PyInstaller...
 %PYTHON% -m PyInstaller --version
 if errorlevel 1 (
     echo ERROR: PyInstaller was not found in Conda environment "rubi".
-    echo Please install PyInstaller in that environment, then run this script again.
     pause
     exit /b 1
 )
@@ -51,52 +54,45 @@ echo.
 echo Cleaning previous build output...
 if exist "build" rmdir /s /q "build"
 if exist "dist\furi-lrc-player" rmdir /s /q "dist\furi-lrc-player"
-if exist "furi-lrc-player.spec" del /q "furi-lrc-player.spec"
 echo.
 
 echo Building the application...
-%PYTHON% -m PyInstaller ^
-    --noconfirm ^
-    --clean ^
-    --windowed ^
-    --onedir ^
-    --name "furi-lrc-player" ^
-    --add-data "furi-lrc_rubi.py;." ^
-    --add-data "fonts;fonts" ^
-    --add-data "settings.json;." ^
-    --collect-all PyQt6 ^
-    --collect-submodules mutagen ^
-    --collect-submodules winsdk ^
-    --hidden-import PyQt6.QtMultimedia ^
-    --hidden-import PyQt6.QtMultimediaWidgets ^
-    "furi-lrc-player.py"
+%PYTHON% -m PyInstaller --noconfirm --clean "furi-lrc-player.spec"
 
 if errorlevel 1 (
     echo.
     echo ERROR: PyInstaller failed.
-    echo Check the messages above for details.
     pause
     exit /b 1
 )
 
-echo Copying runtime resources beside the executable...
-if exist "dist\furi-lrc-player\fonts" rmdir /s /q "dist\furi-lrc-player\fonts"
-xcopy /e /i /y "fonts" "dist\furi-lrc-player\fonts" >nul
-if errorlevel 1 (
-    echo ERROR: Could not copy the fonts folder.
+echo.
+echo Creating default folders in output...
+mkdir "dist\furi-lrc-player\songs"  2>nul
+mkdir "dist\furi-lrc-player\flrc"   2>nul
+mkdir "dist\furi-lrc-player\flpls"  2>nul
+
+echo Verifying bundled desktop-lyrics resources...
+mkdir "dist\furi-lrc-player\data-player" 2>nul
+copy /y "data-player\icon-player.ico" "dist\furi-lrc-player\data-player\" >nul
+
+if not exist "dist\furi-lrc-player\_internal\furi-lrc_rubi.py" (
+    echo ERROR: The desktop lyrics module was not bundled.
+    echo        Check furi-lrc-player.spec and rebuild.
     pause
     exit /b 1
 )
 
-copy /y "furi-lrc_rubi.py" "dist\furi-lrc-player\" >nul
-if errorlevel 1 (
-    echo ERROR: Could not copy furi-lrc_rubi.py.
+if not exist "dist\furi-lrc-player\_internal\fonts\NotoSerifJP-SemiBold.ttf" (
+    echo ERROR: Desktop lyrics fonts were not bundled.
+    echo        Check furi-lrc-player.spec and rebuild.
     pause
     exit /b 1
 )
 
-if exist "settings.json" copy /y "settings.json" "dist\furi-lrc-player\" >nul
-if exist "_last_playlist.flpl" copy /y "_last_playlist.flpl" "dist\furi-lrc-player\" >nul
+echo Copying sample files...
+%PYTHON% -c "import shutil,pathlib; p=pathlib.Path('songs/跚をあけて.mp3'); shutil.copy2(p, pathlib.Path('dist/furi-lrc-player/songs')/p.name) if p.exists() else None"
+if exist "flrc\tobira-wo-akete.flrc"    copy /y "flrc\tobira-wo-akete.flrc"    "dist\furi-lrc-player\flrc\" >nul
 
 echo.
 echo ============================================================
@@ -105,9 +101,6 @@ echo ============================================================
 echo.
 echo Output folder:
 echo   %cd%\dist\furi-lrc-player
-echo.
-echo Start the packaged app with:
-echo   %cd%\dist\furi-lrc-player\furi-lrc-player.exe
 echo.
 pause
 exit /b 0

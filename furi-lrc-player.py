@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QListWidget, QListWidgetItem, QLabel, QPushButton,
     QSlider, QFileDialog, QMenu, QSizePolicy, QFrame, QScrollArea,
     QAbstractItemView, QToolButton, QDialog, QDialogButtonBox,
-    QFormLayout, QLineEdit,
+    QFormLayout, QLineEdit, QSystemTrayIcon,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QUrl, QSize, pyqtSignal, QObject, QPoint, QPointF,
@@ -32,6 +32,7 @@ from PyQt6.QtGui import (
     QPixmap, QLinearGradient, QBrush, QAction, QKeySequence, QShortcut,
     QDragEnterEvent, QDropEvent, QIcon, QPolygonF,
 )
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 try:
     from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -50,17 +51,89 @@ try:
 except ImportError:
     HAS_MUTAGEN = False
 
-def _app_dir() -> Path:
+# ── Runtime root (works both in source and PyInstaller onedir bundle) ────────
+def _app_root() -> Path:
+    """User-data root: always the folder containing the exe / script."""
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+        return Path(sys.executable).parent
+    return Path(__file__).parent
 
-APP_DIR = _app_dir()
+
+def _bundle_root() -> Path:
+    """Read-only asset root: _MEIPASS when frozen, same as _app_root() otherwise."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).parent
+
+
+_BASE     = _app_root()
+_DIR_DATA  = _BASE / "data-player"
+_DIR_SONGS = _BASE / "songs"
+_DIR_FLRC  = _BASE / "flrc"
+_DIR_FLPLS = _BASE / "flpls"
+
+
+# Use a per-user local socket so starting the executable again activates the
+# existing player instead of creating another process and tray icon.
+_SINGLE_INSTANCE_SERVER = "furi-lrc-player-single-instance-v1"
+
+
+class _SingleInstance:
+    """Own the local server for the running player instance."""
+
+    def __init__(self, app: QApplication):
+        self._server = QLocalServer(app)
+        self._window: Optional[QMainWindow] = None
+        self._server.newConnection.connect(self._activate_existing_window)
+
+    @classmethod
+    def acquire(cls, app: QApplication) -> Optional["_SingleInstance"]:
+        """Return the server owner, or None after notifying an existing app."""
+        client = QLocalSocket()
+        client.connectToServer(_SINGLE_INSTANCE_SERVER)
+        if client.waitForConnected(500):
+            client.write(b"activate")
+            client.waitForBytesWritten(200)
+            client.disconnectFromServer()
+            return None
+
+        # A prior crash can leave the named server behind.  It is safe to
+        # remove only after connecting to it has failed.
+        QLocalServer.removeServer(_SINGLE_INSTANCE_SERVER)
+        instance = cls(app)
+        if not instance._server.listen(_SINGLE_INSTANCE_SERVER):
+            # Another launch won the race after removeServer().  Ask it to
+            # activate and leave this process without constructing any UI.
+            client.connectToServer(_SINGLE_INSTANCE_SERVER)
+            if client.waitForConnected(500):
+                client.write(b"activate")
+                client.waitForBytesWritten(200)
+            return None
+        return instance
+
+    def set_window(self, window: QMainWindow):
+        self._window = window
+
+    def _activate_existing_window(self):
+        while self._server.hasPendingConnections():
+            socket = self._server.nextPendingConnection()
+            if socket:
+                socket.readAll()
+                socket.disconnectFromServer()
+        if self._window:
+            self._window.showNormal()
+            self._window.raise_()
+            self._window.activateWindow()
+
 
 # ── Load overlay module (furi-lrc_rubi.py) ──────────────────────────────────
 def _load_overlay():
-    p = APP_DIR / "furi-lrc_rubi.py"
-    if not p.exists():
+    candidates = [_app_root() / "furi-lrc_rubi.py"]
+    # PyInstaller extracts datas to sys._MEIPASS; check there too
+    if hasattr(sys, "_MEIPASS"):
+        candidates.append(Path(sys._MEIPASS) / "furi-lrc_rubi.py")
+    p = next((c for c in candidates if c.exists()), None)
+    if p is None:
         return None
     spec = importlib.util.spec_from_file_location("_furi_lrc_rubi", p)
     mod  = importlib.util.module_from_spec(spec)
@@ -72,6 +145,8 @@ def _load_overlay():
         return None
 
 _OV = _load_overlay()
+if _OV:
+    _OV.CONFIG_PATH = _DIR_DATA / "settings.json"
 
 # ── Theme ───────────────────────────────────────────────────────────────────
 _DARK = "#1e1e2e"
@@ -139,6 +214,7 @@ class Track:
     dur_ms:      int = 0      # filled by QMediaPlayer on first play
     art_data:    bytes = dataclasses.field(default_factory=bytes, repr=False)
     lyrics_path: str = ""     # manually assigned JSON lyrics
+    lyrics_offset_ms: int = 500  # lyric timing offset relative to audio (ms)
 
     def display_title(self) -> str:
         return self.title or Path(self.path).stem
@@ -510,6 +586,31 @@ class NowPlayingPanel(QWidget):
 
 
 # ── Playlist panel ────────────────────────────────────────────────────────────
+class PlaylistItemWidget(QWidget):
+    def __init__(self, title: str, lyrics_name: str, current: bool):
+        super().__init__()
+        self._title = QLabel(title)
+        self._title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        self._lyrics = QLabel(lyrics_name)
+        self._lyrics.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._lyrics.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self._lyrics.setMinimumWidth(80)
+        self._lyrics.setToolTip(lyrics_name)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 0, 8, 0)
+        lay.setSpacing(10)
+        lay.addWidget(self._title, 1)
+        lay.addWidget(self._lyrics, 0)
+
+        self.set_current(current)
+
+    def set_current(self, current: bool):
+        self._title.setStyleSheet(f"color: {_BLUE if current else _TEXT}; background: transparent;")
+        self._lyrics.setStyleSheet(f"color: {_SUB}; background: transparent;")
+
+
 class PlaylistPanel(QWidget):
     play_index    = pyqtSignal(int)
     add_files     = pyqtSignal(list)   # list[str]
@@ -579,14 +680,18 @@ class PlaylistPanel(QWidget):
     def _add_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "音声ファイルを追加",
-            "",
+            str(_DIR_SONGS),
             "Audio Files (*.mp3 *.flac *.aac *.m4a *.wav *.ogg *.opus *.wma *.ape *.aiff)"
         )
         if paths:
             self.add_files.emit(paths)
 
     def _ctx_menu(self, pos):
-        row = self._list.currentRow()
+        item = self._list.itemAt(pos)
+        if item is None:
+            return
+        self._list.setCurrentItem(item)
+        row = self._list.row(item)
         menu = QMenu(self)
         a1 = menu.addAction("再生")
         a1.triggered.connect(lambda: self.play_index.emit(row))
@@ -603,10 +708,15 @@ class PlaylistPanel(QWidget):
         self._list.clear()
         for i, t in enumerate(tracks):
             dur = f"  {_ms_fmt(t.dur_ms)}" if t.dur_ms else ""
-            text = f"{i+1:02d}  {t.display_title()}{dur}"
-            item = QListWidgetItem(text)
-            item.setForeground(QColor(_BLUE if i == current else _TEXT))
+            title = f"{i+1:02d}  {t.display_title()}{dur}"
+            lyrics_name = Path(t.lyrics_path).stem if t.lyrics_path else ""
+            item = QListWidgetItem()
+            item.setSizeHint(QSize(0, 28))
             self._list.addItem(item)
+            self._list.setItemWidget(
+                item,
+                PlaylistItemWidget(title, lyrics_name, i == current),
+            )
         if 0 <= current < self._list.count():
             self._list.setCurrentRow(current)
             self._list.scrollToItem(self._list.currentItem())
@@ -616,7 +726,9 @@ class PlaylistPanel(QWidget):
         for i in range(self._list.count()):
             item = self._list.item(i)
             if item:
-                item.setForeground(QColor(_BLUE if i == idx else _TEXT))
+                widget = self._list.itemWidget(item)
+                if isinstance(widget, PlaylistItemWidget):
+                    widget.set_current(i == idx)
         if 0 <= idx < self._list.count():
             self._list.setCurrentRow(idx)
 
@@ -632,14 +744,15 @@ class PlaylistPanel(QWidget):
 
 # ── Control bar ───────────────────────────────────────────────────────────────
 class ControlBar(QWidget):
-    play_pause  = pyqtSignal()
-    stop        = pyqtSignal()
-    prev_track  = pyqtSignal()
-    next_track  = pyqtSignal()
-    seek_rel    = pyqtSignal(int)    # ms delta
-    loop_changed = pyqtSignal(int)  # LoopMode value
-    vol_changed  = pyqtSignal(float)
-    seeked       = pyqtSignal(int)  # from seek bar
+    play_pause      = pyqtSignal()
+    stop            = pyqtSignal()
+    prev_track      = pyqtSignal()
+    next_track      = pyqtSignal()
+    seek_rel        = pyqtSignal(int)    # ms delta
+    loop_changed    = pyqtSignal(int)   # LoopMode value
+    vol_changed     = pyqtSignal(float)
+    seeked          = pyqtSignal(int)   # from seek bar
+    offset_requested = pyqtSignal()     # user clicked offset button
 
     def __init__(self):
         super().__init__()
@@ -723,6 +836,13 @@ class ControlBar(QWidget):
 
         trans.addStretch()
 
+        # Offset button (right-most)
+        self._btn_offset = QPushButton("±0ms")
+        self._btn_offset.setFixedSize(80, 32)
+        self._btn_offset.setToolTip("歌詞のタイミングオフセット (ms)")
+        self._btn_offset.clicked.connect(self.offset_requested)
+        trans.addWidget(self._btn_offset)
+
         outer.addLayout(trans)
 
     def _cycle_loop(self):
@@ -752,6 +872,9 @@ class ControlBar(QWidget):
 
     def set_volume(self, v: float):
         self._vol.set_volume(v)
+
+    def set_offset(self, ms: int):
+        self._btn_offset.setText(f"{ms:+d}ms" if ms != 0 else "±0ms")
 
     def get_loop_mode(self) -> LoopMode:
         return self._loop_mode
@@ -805,6 +928,8 @@ class _OverlayMousePane(QWidget):
 class LyricOverlay(QWidget):
     """Floating lyrics window driven by PlayerWindow instead of SMTC."""
 
+    visibility_changed = pyqtSignal(bool)
+
     def __init__(self):
         super().__init__()
         if _OV is None:
@@ -821,6 +946,8 @@ class LyricOverlay(QWidget):
         self._preview_zone_size = 48
 
         cfg = _OV.load_config()
+        if not _OV.CONFIG_PATH.exists():
+            cfg.update(_OV._screen_relative_defaults())
         self.cfg = cfg
 
         self._state_save_timer = QTimer(self)
@@ -897,24 +1024,24 @@ class LyricOverlay(QWidget):
             print(f"[overlay] lyrics load error: {e}", file=sys.stderr)
 
     def auto_load_lyrics(self, audio_path: str, title: str):
-        """Search for a matching JSON lyrics file near the audio file."""
+        """Search for a matching FLRC lyrics file near the audio file."""
         ap   = Path(audio_path)
         stem = ap.stem.lower()
 
         def _try(directory: Path):
-            # Exact stem match
-            exact = directory / f"{ap.stem}.json"
+            exact = directory / f"{ap.stem}.flrc"
             if exact.exists():
                 self._load_lyrics(str(exact))
                 return True
-            # Fuzzy match
-            for p in directory.glob("*.json"):
+            for p in directory.glob("*.flrc"):
                 ps = p.stem.lower()
                 if stem in ps or ps in stem or title.lower() in ps:
                     self._load_lyrics(str(p))
                     return True
             return False
 
+        if _try(_DIR_FLRC):
+            return
         if _try(ap.parent):
             return
         _try(ap.parent / "lyrics")
@@ -1062,8 +1189,24 @@ class LyricOverlay(QWidget):
             self.setWindowOpacity(original_cfg["opacity"])
             self.canvas.apply_cfg(original_cfg)
 
+    def _context_menu_font(self) -> QFont:
+        """Use the bundled menu typeface at the normal application menu size."""
+        font = getattr(_OV, "_MENU_FONT", None)
+        if font is None:
+            _OV._load_menu_font()
+            font = getattr(_OV, "_MENU_FONT", None)
+        font = QFont(font) if font is not None else QApplication.font()
+        app_font = QApplication.font()
+        point_size = app_font.pointSizeF()
+        if point_size > 0:
+            font.setPointSizeF(point_size)
+        else:
+            font.setPointSize(10)
+        return font
+
     def contextMenuEvent(self, e):
         menu = QMenu(self)
+        menu.setFont(self._context_menu_font())
         a = menu.addAction("歌詞ファイルを開く…")
         a.triggered.connect(self._open_lyrics)
         menu.addSeparator()
@@ -1077,8 +1220,16 @@ class LyricOverlay(QWidget):
         a.triggered.connect(self.hide)
         menu.exec(e.globalPos())
 
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.visibility_changed.emit(True)
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self.visibility_changed.emit(False)
+
     def _open_lyrics(self):
-        p, _ = QFileDialog.getOpenFileName(self, "歌詞 JSON を選択", "", "JSON (*.json)")
+        p, _ = QFileDialog.getOpenFileName(self, "歌詞ファイルを選択", str(_DIR_FLRC), "FLRC歌詞 (*.flrc)")
         if p:
             self._load_lyrics(p)
 
@@ -1103,13 +1254,13 @@ class LyricOverlay(QWidget):
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
-            if any(u.toLocalFile().lower().endswith(".json") for u in e.mimeData().urls()):
+            if any(u.toLocalFile().lower().endswith(".flrc") for u in e.mimeData().urls()):
                 e.acceptProposedAction()
 
     def dropEvent(self, e):
         for url in e.mimeData().urls():
             p = url.toLocalFile()
-            if p.lower().endswith(".json"):
+            if p.lower().endswith(".flrc"):
                 self._load_lyrics(p)
                 break
 
@@ -1140,6 +1291,15 @@ class PlayerWindow(QMainWindow):
         self.resize(820, 520)
         self.setMinimumSize(560, 380)
 
+        # ── Window & tray icon ──
+        _ico_path = _DIR_DATA / "icon-player.ico"
+        if _ico_path.exists():
+            _app_icon = QIcon(str(_ico_path))
+            self.setWindowIcon(_app_icon)
+            QApplication.instance().setWindowIcon(_app_icon)
+        else:
+            _app_icon = QIcon()
+
         # ── State ──
         self._tracks:  List[Track]    = []
         self._current: int            = -1
@@ -1148,6 +1308,7 @@ class PlayerWindow(QMainWindow):
         self._current_playlist_path: str = ""
         self._volume: float = 1.0
         self._pending_restore_pos_ms: Optional[int] = None
+        self._pending_autoplay: bool = False
 
         # ── Media player ──
         self._player: Optional[QMediaPlayer] = None
@@ -1172,6 +1333,7 @@ class PlayerWindow(QMainWindow):
             LyricOverlay() if _OV else None
         )
         if self._overlay:
+            self._overlay.visibility_changed.connect(self._sync_overlay_visibility)
             self._overlay.show()
 
         # ── Build UI ──
@@ -1185,6 +1347,13 @@ class PlayerWindow(QMainWindow):
         self._geo_timer.setSingleShot(True)
         self._geo_timer.setInterval(600)
         self._geo_timer.timeout.connect(self._save_geometry)
+
+        # ── System tray ──
+        self._tray = QSystemTrayIcon(_app_icon, self)
+        self._tray.setToolTip("furi-lrc Player")
+        self._build_tray_menu()
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
 
         self._load_last_playlist()
 
@@ -1232,6 +1401,7 @@ class PlayerWindow(QMainWindow):
         self._ctrl.loop_changed.connect(self._set_loop)
         self._ctrl.vol_changed.connect(self._set_volume)
         self._ctrl.seeked.connect(self._seek)
+        self._ctrl.offset_requested.connect(self._open_offset_dialog)
         self._ctrl.set_loop_mode(self._loop)
         main_lay.addWidget(self._ctrl)
 
@@ -1271,8 +1441,84 @@ class PlayerWindow(QMainWindow):
         vm.addSeparator()
         _act(vm, "歌詞オーバーレイ設定…", self._open_overlay_settings)
 
+    def _build_tray_menu(self):
+        from PyQt6.QtGui import QActionGroup
+        menu = QMenu()
+        menu.setStyleSheet(_STYLESHEET)
+
+        act_prev = QAction("前の曲", self)
+        act_prev.triggered.connect(self.prev_track)
+        menu.addAction(act_prev)
+
+        act_next = QAction("次の曲", self)
+        act_next.triggered.connect(self.next_track)
+        menu.addAction(act_next)
+
+        menu.addSeparator()
+
+        loop_menu = menu.addMenu("再生順")
+        loop_group = QActionGroup(self)
+        loop_group.setExclusive(True)
+        _loop_labels = ["順番再生", "全曲ループ", "1曲ループ", "シャッフル"]
+        self._tray_loop_acts = []
+        for mode in LoopMode:
+            act = QAction(_loop_labels[int(mode)], self)
+            act.setCheckable(True)
+            act.setChecked(mode == self._loop)
+            act.triggered.connect(lambda checked, m=mode: self._set_loop(int(m)))
+            loop_group.addAction(act)
+            loop_menu.addAction(act)
+            self._tray_loop_acts.append(act)
+
+        self._tray_act_overlay = QAction("デスクトップ歌詞：オン", self)
+        self._tray_act_overlay.triggered.connect(self._toggle_overlay_tray)
+        menu.addAction(self._tray_act_overlay)
+        self._update_tray_overlay_label()
+
+        menu.addSeparator()
+
+        act_quit = QAction("終了", self)
+        act_quit.triggered.connect(self._quit_app)
+        menu.addAction(act_quit)
+
+        self._tray.setContextMenu(menu)
+
+    def _toggle_overlay_tray(self):
+        if self._overlay:
+            visible = not self._overlay.isVisible()
+            self._overlay.setVisible(visible)
+            if hasattr(self, "_overlay_action"):
+                self._overlay_action.setChecked(visible)
+            self._update_tray_overlay_label()
+
+    def _sync_overlay_visibility(self, visible: bool):
+        if hasattr(self, "_overlay_action"):
+            self._overlay_action.blockSignals(True)
+            self._overlay_action.setChecked(visible)
+            self._overlay_action.blockSignals(False)
+        self._update_tray_overlay_label()
+
+    def _update_tray_overlay_label(self):
+        if hasattr(self, "_tray_act_overlay"):
+            on = self._overlay is not None and self._overlay.isVisible()
+            self._tray_act_overlay.setText(f"デスクトップ歌詞：{'オン' if on else 'オフ'}")
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.showNormal()
+            self.activateWindow()
+
+    def _quit_app(self):
+        self._save_last_playlist()
+        if self._overlay:
+            self._overlay.save_geometry()
+            self._overlay.close()
+        QApplication.quit()
+
     def _build_shortcuts(self):
         QShortcut(QKeySequence(Qt.Key.Key_Space),      self).activated.connect(self._toggle_play)
+        QShortcut(QKeySequence(Qt.Key.Key_Left),       self).activated.connect(lambda: self._seek_rel(-5000))
+        QShortcut(QKeySequence(Qt.Key.Key_Right),      self).activated.connect(lambda: self._seek_rel(5000))
         QShortcut(QKeySequence("Ctrl+Left"),            self).activated.connect(self.prev_track)
         QShortcut(QKeySequence("Ctrl+Right"),           self).activated.connect(self.next_track)
         QShortcut(QKeySequence("J"),                    self).activated.connect(lambda: self._seek_rel(-5000))
@@ -1280,6 +1526,8 @@ class PlayerWindow(QMainWindow):
         QShortcut(QKeySequence(","),                    self).activated.connect(lambda: self._seek_rel(-1000))
         QShortcut(QKeySequence("."),                    self).activated.connect(lambda: self._seek_rel(1000))
         QShortcut(QKeySequence(Qt.Key.Key_Delete),      self).activated.connect(self._remove_selected)
+        QShortcut(QKeySequence(Qt.Key.Key_Up),          self).activated.connect(lambda: self._adjust_volume(0.05))
+        QShortcut(QKeySequence(Qt.Key.Key_Down),        self).activated.connect(lambda: self._adjust_volume(-0.05))
 
     # ── Playback control ──────────────────────────────────────────────────────
 
@@ -1296,15 +1544,32 @@ class PlayerWindow(QMainWindow):
     def _toggle_play(self):
         if not self._player:
             return
-        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+        # A restored source can report StoppedState before its duration is
+        # available.  Keep the requested seek pending and start only after it
+        # has been applied, instead of starting from position 0.
+        if self._pending_restore_pos_ms is not None:
+            self._pending_autoplay = True
+            self._apply_pending_restore_position()
+            return
+        state = self._player.playbackState()
+        if state == QMediaPlayer.PlaybackState.PlayingState:
             self._player.pause()
-        elif self._player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
+        elif state == QMediaPlayer.PlaybackState.PausedState:
             self._player.play()
         else:
+            # StoppedState: source already loaded by _prepare_current_track.
+            # Use the pending-restore path so the seek is applied *after*
+            # play() initialises the backend (avoids position being reset to 0).
             if self._current < 0 and self._tracks:
                 self._play_index(0)
             elif 0 <= self._current < len(self._tracks):
-                self._play_index(self._current)
+                saved_pos = self._player.position()
+                if saved_pos > 0:
+                    self._pending_restore_pos_ms = saved_pos
+                    self._pending_autoplay = True
+                    self._player.setSource(QUrl.fromLocalFile(self._tracks[self._current].path))
+                else:
+                    self._player.play()
 
     def _stop(self):
         if self._player:
@@ -1362,9 +1627,15 @@ class PlayerWindow(QMainWindow):
         if self._audio:
             self._audio.setVolume(self._volume)
 
+    def _adjust_volume(self, delta: float):
+        self._set_volume(self._volume + delta)
+        self._ctrl.set_volume(self._volume)
+
     def _set_loop(self, mode: int):
         self._loop = LoopMode(mode)
         self._ctrl.set_loop_mode(self._loop)
+        if hasattr(self, "_tray_loop_acts"):
+            self._tray_loop_acts[mode].setChecked(True)
 
     # ── QMediaPlayer callbacks ────────────────────────────────────────────────
 
@@ -1382,33 +1653,109 @@ class PlayerWindow(QMainWindow):
         playing = (state == QMediaPlayer.PlaybackState.PlayingState)
         self._ctrl.set_playing(playing)
         if self._overlay:
-            pos = self._player.position() / 1000.0 if self._player else 0.0
-            self._overlay.canvas.sync_time(pos, playing, force_hard=True)
+            ms  = self._player.position() if self._player else 0
+            adj = max(0.0, (ms + self._current_offset_ms()) / 1000.0)
+            self._overlay.canvas.sync_time(adj, playing, force_hard=True)
 
     def _on_media_status(self, status):
         if self._player and status == QMediaPlayer.MediaStatus.EndOfMedia:
             self.next_track()
+        elif status == QMediaPlayer.MediaStatus.LoadedMedia:
+            self._apply_pending_restore_position()
 
     def _apply_pending_restore_position(self):
         if self._player and self._pending_restore_pos_ms is not None:
-            pos = max(0, int(self._pending_restore_pos_ms))
             dur = self._player.duration()
-            if dur > 0:
-                pos = min(pos, max(0, dur - 1000))
+            # QMediaPlayer commonly emits a durationChanged(0) while changing
+            # source.  Seeking then is discarded when the backend finishes
+            # loading, so wait for a real duration before consuming the value.
+            if dur <= 0:
+                return
+            pos = min(max(0, int(self._pending_restore_pos_ms)), max(0, dur - 1000))
+            autoplay = getattr(self, "_pending_autoplay", False)
+            # While the backend is in StoppedState a setPosition() is silently
+            # discarded as soon as playback starts, so the restored offset is
+            # lost.  Only consume (and apply) the pending value when we are
+            # actually going to start playing; otherwise keep it pending so the
+            # seek can be applied *together* with play() when the user presses
+            # the button — which is what guarantees we resume from the offset
+            # instead of jumping back to 0.
+            if not autoplay:
+                # Show the restored position on the UI but keep it pending.
+                self._ctrl.set_position(pos, dur)
+                if self._overlay:
+                    adj = max(0.0, (pos + self._current_offset_ms()) / 1000.0)
+                    self._overlay.canvas.sync_time(adj, False, force_hard=True)
+                return
+            self._pending_restore_pos_ms = None
+            self._pending_autoplay = False
             self._player.setPosition(pos)
             self._ctrl.set_position(pos, dur)
             if self._overlay:
-                playing = self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-                self._overlay.canvas.sync_time(pos / 1000.0, playing, force_hard=True)
-            self._pending_restore_pos_ms = None
+                adj = max(0.0, (pos + self._current_offset_ms()) / 1000.0)
+                self._overlay.canvas.sync_time(adj, True, force_hard=True)
+            # Queue play after the seek so the backend cannot reset the
+            # restored position as it transitions out of StoppedState, then
+            # re-apply the seek once it is actually playing.
+            def _start():
+                self._player.play()
+                QTimer.singleShot(60, lambda: self._player.setPosition(pos))
+            QTimer.singleShot(0, _start)
 
     # ── Sync overlay canvas ───────────────────────────────────────────────────
+
+    def _current_offset_ms(self) -> int:
+        if 0 <= self._current < len(self._tracks):
+            return self._tracks[self._current].lyrics_offset_ms
+        return 0
+
+    def _open_offset_dialog(self):
+        if not (0 <= self._current < len(self._tracks)):
+            return
+        track = self._tracks[self._current]
+        current_offset = track.lyrics_offset_ms
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("歌詞オフセット")
+        dlg.setMinimumWidth(280)
+        form = QFormLayout(dlg)
+        form.setContentsMargins(16, 16, 16, 8)
+        form.setSpacing(10)
+
+        edit = QLineEdit(str(current_offset))
+        edit.setPlaceholderText("例: -200 または 500")
+        edit.setToolTip("正の値: 歌詞を遅らせる / 負の値: 歌詞を早める")
+        form.addRow("オフセット (ms):", edit)
+
+        note = QLabel("正の値 → 歌詞を遅らせる、負の値 → 早める")
+        note.setStyleSheet(f"color: {_SUB}; font-size: 11px;")
+        form.addRow(note)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+
+        dlg.setStyleSheet(_STYLESHEET)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            new_offset = int(edit.text().strip())
+        except ValueError:
+            return
+
+        track.lyrics_offset_ms = new_offset
+        self._ctrl.set_offset(new_offset)
 
     def _push_sync_from_position(self, ms: int):
         if not (self._overlay and self._player):
             return
         playing = (self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
-        self._overlay.canvas.sync_time(ms / 1000.0, playing)
+        adjusted = ms + self._current_offset_ms()
+        self._overlay.canvas.sync_time(max(0.0, adjusted / 1000.0), playing)
 
     # ── Track management ──────────────────────────────────────────────────────
 
@@ -1416,6 +1763,7 @@ class PlayerWindow(QMainWindow):
         self._now_playing.update_track(track)
         self.setWindowTitle(f"furi-lrc Player — {track.display_title()}")
         self._playlist.highlight(self._current)
+        self._ctrl.set_offset(track.lyrics_offset_ms)
         if self._overlay:
             if track.lyrics_path and Path(track.lyrics_path).exists():
                 self._overlay._load_lyrics(track.lyrics_path)
@@ -1427,22 +1775,19 @@ class PlayerWindow(QMainWindow):
             return
         track = self._tracks[self._current]
         self._pending_restore_pos_ms = max(0, int(pos_ms))
+        self._pending_autoplay = autoplay
         self._player.setSource(QUrl.fromLocalFile(track.path))
         self._on_track_started(track)
-        if autoplay:
-            self._player.play()
-        else:
-            self._player.pause()
-        QTimer.singleShot(0, self._apply_pending_restore_position)
 
     def _assign_lyrics_to_track(self, row: int):
         if not (0 <= row < len(self._tracks)):
             return
         p, _ = QFileDialog.getOpenFileName(
-            self, f"歌詞を指定 — {self._tracks[row].display_title()}", "", "JSON (*.json)"
+            self, f"歌詞を指定 — {self._tracks[row].display_title()}", str(_DIR_FLRC), "FLRC歌詞 (*.flrc)"
         )
         if p:
             self._tracks[row].lyrics_path = p
+            self._playlist.rebuild(self._tracks, self._current)
             # if currently playing this track, reload lyrics immediately
             if row == self._current and self._overlay:
                 self._overlay._load_lyrics(p)
@@ -1453,7 +1798,7 @@ class PlayerWindow(QMainWindow):
         self._playlist.rebuild(self._tracks, self._current)
 
     def _add_files_dialog(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "音声ファイルを追加", "", _AUDIO_FILTER)
+        paths, _ = QFileDialog.getOpenFileNames(self, "音声ファイルを追加", str(_DIR_SONGS), _AUDIO_FILTER)
         if paths:
             self._add_tracks(paths)
 
@@ -1488,7 +1833,7 @@ class PlayerWindow(QMainWindow):
     def _save_playlist_as(self):
         """Ctrl+Shift+S: always prompt for a new path."""
         path, _ = QFileDialog.getSaveFileName(
-            self, "名前を付けて保存", "", f"furi-lrc Playlist (*{_PLAYLIST_EXT})"
+            self, "名前を付けて保存", str(_DIR_FLPLS), f"furi-lrc Playlist (*{_PLAYLIST_EXT})"
         )
         if path:
             if not path.endswith(_PLAYLIST_EXT):
@@ -1498,7 +1843,7 @@ class PlayerWindow(QMainWindow):
 
     def _load_playlist_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "プレイリストを開く", "", f"furi-lrc Playlist (*{_PLAYLIST_EXT})"
+            self, "プレイリストを開く", str(_DIR_FLPLS), f"furi-lrc Playlist (*{_PLAYLIST_EXT})"
         )
         if path:
             self._load_playlist(path)
@@ -1510,7 +1855,7 @@ class PlayerWindow(QMainWindow):
             if self._player else False
         )
         data = {
-            "tracks":    [{"path": t.path, "lyrics": t.lyrics_path} for t in self._tracks],
+            "tracks":    [{"path": t.path, "lyrics": t.lyrics_path, "offset_ms": t.lyrics_offset_ms} for t in self._tracks],
             "current":   self._current,
             "loop_mode": int(self._loop),
             "position_ms": position_ms,
@@ -1533,12 +1878,15 @@ class PlayerWindow(QMainWindow):
         for entry in data.get("tracks", []):
             # support both old format (str) and new format (dict)
             if isinstance(entry, str):
-                p, lp = entry, ""
+                p, lp, off = entry, "", 0
             else:
-                p, lp = entry.get("path", ""), entry.get("lyrics", "")
+                p   = entry.get("path", "")
+                lp  = entry.get("lyrics", "")
+                off = int(entry.get("offset_ms", 500))
             if Path(p).exists():
                 t = _build_track(p)
                 t.lyrics_path = lp if lp and Path(lp).exists() else ""
+                t.lyrics_offset_ms = off
                 tracks.append(t)
         self._tracks  = tracks
         self._current = min(data.get("current", 0), len(self._tracks) - 1)
@@ -1546,8 +1894,7 @@ class PlayerWindow(QMainWindow):
             mode = LoopMode(data.get("loop_mode", int(LoopMode.LOOP_ALL)))
         except ValueError:
             mode = LoopMode.LOOP_ALL
-        self._loop = mode
-        self._ctrl.set_loop_mode(mode)
+        self._set_loop(int(mode))
         self._volume = max(0.0, min(1.0, float(data.get("volume", self._volume))))
         if self._audio:
             self._audio.setVolume(self._volume)
@@ -1558,24 +1905,27 @@ class PlayerWindow(QMainWindow):
         ]
         self._playlist.rebuild(self._tracks, self._current)
         if 0 <= self._current < len(self._tracks):
+            self._ctrl.set_offset(self._tracks[self._current].lyrics_offset_ms)
             self._prepare_current_track(
                 int(data.get("position_ms", 0)),
                 False,
             )
         else:
             self._now_playing.update_track(None)
+            self._ctrl.set_offset(0)
         # track the path for Ctrl+S quick-save (skip for _last_playlist auto-save)
-        last = str(APP_DIR / "_last_playlist.flpl")
+        last = str(_DIR_DATA / "_last_playlist.flpl")
         if path != last:
             self._current_playlist_path = path
 
     def _load_last_playlist(self):
-        last = APP_DIR / "_last_playlist.flpl"
+        last = _DIR_DATA / "_last_playlist.flpl"
         if last.exists():
             self._load_playlist(str(last))
 
     def _save_last_playlist(self):
-        last = APP_DIR / "_last_playlist.flpl"
+        _DIR_DATA.mkdir(parents=True, exist_ok=True)
+        last = _DIR_DATA / "_last_playlist.flpl"
         self._save_playlist(str(last))
 
     # ── Overlay toggle ────────────────────────────────────────────────────────
@@ -1583,11 +1933,12 @@ class PlayerWindow(QMainWindow):
     def _toggle_overlay(self, checked: bool):
         if self._overlay:
             self._overlay.setVisible(checked)
+        self._update_tray_overlay_label()
 
     def _open_lyrics_for_current(self):
         if not self._overlay:
             return
-        p, _ = QFileDialog.getOpenFileName(self, "歌詞 JSON を選択", "", "JSON (*.json)")
+        p, _ = QFileDialog.getOpenFileName(self, "歌詞ファイルを選択", str(_DIR_FLRC), "FLRC歌詞 (*.flrc)")
         if p:
             self._overlay._load_lyrics(p)
 
@@ -1627,11 +1978,11 @@ class PlayerWindow(QMainWindow):
         pass  # could persist window size if desired
 
     def closeEvent(self, e):
-        self._save_last_playlist()
-        if self._overlay:
-            self._overlay.save_geometry()
-            self._overlay.close()
-        super().closeEvent(e)
+        if self._tray.isVisible():
+            e.ignore()
+            self.hide()
+        else:
+            self._quit_app()
 
 
 # ── Entry ────────────────────────────────────────────────────────────────────
@@ -1642,8 +1993,14 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("furi-lrc-player")
 
+    single_instance = _SingleInstance.acquire(app)
+    if single_instance is None:
+        # The already-running player was asked to restore and activate itself.
+        # Do not construct a second window or system-tray icon.
+        return
+
     # Load bundled Noto Sans JP and apply as app-wide UI font
-    _font_path = APP_DIR / "fonts" / "NotoSansJP-Regular.ttf"
+    _font_path = _bundle_root() / "fonts" / "NotoSansJP-Regular.ttf"
     if _font_path.exists():
         _fid = QFontDatabase.addApplicationFont(str(_font_path))
         if _fid >= 0:
@@ -1665,6 +2022,7 @@ def main():
         _OV._load_menu_font()
 
     win = PlayerWindow()
+    single_instance.set_window(win)
     win.show()
     sys.exit(app.exec())
 

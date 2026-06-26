@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QDialog,
     QFormLayout, QLineEdit, QDialogButtonBox, QTabWidget,
     QDoubleSpinBox, QColorDialog, QPushButton, QFileDialog,
-    QSpinBox, QCheckBox,
+    QSpinBox, QCheckBox, QSlider, QLabel, QGroupBox,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, pyqtSignal, QObject, QPoint, QPointF, QRectF, QRect,
@@ -50,36 +50,84 @@ try:
 except ImportError:
     pass
 
-def _app_dir() -> Path:
+# ── Runtime root (works both in source and PyInstaller onedir bundle) ───────
+def _app_root() -> Path:
+    """User-data root: always the folder containing the exe / script."""
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+        return Path(sys.executable).parent
+    return Path(__file__).parent
 
-APP_DIR = _app_dir()
+
+def _bundle_root() -> Path:
+    """Read-only asset root: _MEIPASS when frozen, same as _app_root() otherwise."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).parent
+
 
 # ── Config ───
-FONTS_DIR   = APP_DIR / "fonts"
-CONFIG_PATH = APP_DIR / "settings.json"
+FONTS_DIR   = _bundle_root() / "fonts"
+CONFIG_PATH = _app_root() / "settings.json"
 DEFAULT_CFG = dict(
-    x=50, y=50, w=580, h=320,
-    opacity=0.88, locked=False,
+    x=0, y=0, w=941, h=106,
+    opacity=0.85, locked=True,
     font_jp=str(FONTS_DIR / "NotoSerifJP-SemiBold.ttf"),
     font_zh=str(FONTS_DIR / "msyhbd.ttc"),
-    font_size_jp=20, font_size_rt=10, font_size_zh=14,
-    spacing_rt=2, spacing_zh=-8,
-    color_sung="#4fc3f7", color_unsung="#888888", color_zh="#aaaaaa",
-    lyrics_path="", hide_on_pause=True, unlock_zone=48,
-    text_shadow="2px 2px 8px rgba(0,0,0,0.85)",
+    font_size_jp=33, font_size_rt=15, font_size_zh=22,
+    spacing_rt=-10, spacing_zh=0,
+    color_sung="#ffe205", color_unsung="#0effd7", color_zh="#26d7ff",
+    lyrics_path="", hide_on_pause=False, unlock_zone=80,
+    shadow_enabled=True,
+    shadow_color="#000000",
+    shadow_opacity=0.25,
+    shadow_blur=1.75,
+    shadow_dx=0.75,
+    shadow_dy=0.75,
+    align_h="right",   # "left" | "center" | "right"
+    align_v="bottom",  # "top"  | "center" | "bottom"
 )
+
+
+def _migrate_shadow(cfg: dict) -> dict:
+    """Convert legacy text_shadow CSS string into structured fields."""
+    if "text_shadow" not in cfg:
+        return cfg
+    s = cfg.pop("text_shadow", "")
+    if not s or s.lower() == "none":
+        cfg.setdefault("shadow_enabled", False)
+        return cfg
+    nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+    dx = float(nums[0]) if len(nums) > 0 else 2.0
+    dy = float(nums[1]) if len(nums) > 1 else 2.0
+    blur = float(nums[2]) if len(nums) > 2 else 8.0
+    rgba_m = re.search(
+        r"rgba?\s*\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)", s
+    )
+    if rgba_m:
+        r, g, b = int(float(rgba_m.group(1))), int(float(rgba_m.group(2))), int(float(rgba_m.group(3)))
+        a = float(rgba_m.group(4)) if rgba_m.group(4) else 1.0
+        color = QColor(r, g, b).name()
+    else:
+        hex_m = re.search(r"#[0-9a-fA-F]{3,8}", s)
+        color = hex_m.group() if hex_m else "#000000"
+        a = 1.0
+    cfg.setdefault("shadow_enabled", True)
+    cfg.setdefault("shadow_color",   color)
+    cfg.setdefault("shadow_opacity", round(a, 2))
+    cfg.setdefault("shadow_blur",    int(blur))
+    cfg.setdefault("shadow_dx",      int(dx))
+    cfg.setdefault("shadow_dy",      int(dy))
+    return cfg
 
 
 def load_config() -> dict:
     if CONFIG_PATH.exists():
         try:
             cfg = {**DEFAULT_CFG, **json.loads(CONFIG_PATH.read_text("utf-8"))}
+            cfg = _migrate_shadow(cfg)
             for key in ("font_jp", "font_zh"):
                 val = cfg[key]
-                p = Path(val) if Path(val).is_absolute() else APP_DIR / val
+                p = Path(val) if Path(val).is_absolute() else _app_root() / val
                 if p.suffix.lower() not in {".ttf", ".otf", ".ttc", ".woff", ".woff2"} or not p.exists():
                     cfg[key] = DEFAULT_CFG[key]
             return cfg
@@ -200,23 +248,47 @@ def _mora_progress(m: _MoraDraw, ms: float) -> float:
     return _clamp01((ms - m.s_ms) / max(1.0, m.e_ms - m.s_ms))
 
 
-def _parse_shadow(s: str) -> Optional[Tuple[float, float, QColor]]:
-    if not s or s.lower() == "none":
+@dataclasses.dataclass
+class _ShadowCfg:
+    dx:      float
+    dy:      float
+    blur:    float
+    color:   QColor
+    offsets: List[Tuple[float, float, float]]  # (ox, oy, alpha_scale)
+
+
+def _parse_shadow(cfg: dict) -> Optional["_ShadowCfg"]:
+    if not cfg.get("shadow_enabled", True):
         return None
-    nums = re.findall(r"-?\d+(?:\.\d+)?", s)
-    dx = float(nums[0]) if len(nums) > 0 else 2.0
-    dy = float(nums[1]) if len(nums) > 1 else 2.0
-    rgba_m = re.search(
-        r"rgba?\s*\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)", s
-    )
-    if rgba_m:
-        r, g, b = float(rgba_m.group(1)), float(rgba_m.group(2)), float(rgba_m.group(3))
-        a = float(rgba_m.group(4)) if rgba_m.group(4) else 1.0
-        color = QColor(int(r), int(g), int(b), int(a * 255))
-    else:
-        hex_m = re.search(r"#[0-9a-fA-F]{3,8}", s)
-        color  = QColor(hex_m.group()) if hex_m else QColor(0, 0, 0, 200)
-    return (dx, dy, color)
+    base = QColor(cfg.get("shadow_color", "#000000"))
+    opacity = max(0.0, min(1.0, float(cfg.get("shadow_opacity", 0.85))))
+    dx   = float(cfg.get("shadow_dx", 2))
+    dy   = float(cfg.get("shadow_dy", 2))
+    blur = max(0.0, float(cfg.get("shadow_blur", 8)))
+
+    # Build offset list using float arithmetic so sub-pixel blur values are felt.
+    # Use ~3 spread passes regardless of blur magnitude; pass radius scales linearly.
+    offsets: List[Tuple[float, float, float]] = [(dx, dy, 1.0)]
+    if blur > 0.0:
+        n_passes = 3
+        for i in range(1, n_passes + 1):
+            r = blur * i / n_passes
+            alpha_scale = max(0.05, 1.0 - r / (blur + 1.0))
+            for ox, oy in [
+                (dx - r,       dy      ),
+                (dx + r,       dy      ),
+                (dx,           dy - r  ),
+                (dx,           dy + r  ),
+                (dx - r * 0.7, dy - r * 0.7),
+                (dx + r * 0.7, dy + r * 0.7),
+                (dx - r * 0.7, dy + r * 0.7),
+                (dx + r * 0.7, dy - r * 0.7),
+            ]:
+                offsets.append((ox, oy, alpha_scale))
+
+    c = QColor(base)
+    c.setAlphaF(opacity)
+    return _ShadowCfg(dx=dx, dy=dy, blur=blur, color=c, offsets=offsets)
 
 
 def _load_qt_font(path_str: str, size: int,
@@ -224,13 +296,20 @@ def _load_qt_font(path_str: str, size: int,
     if path_str:
         p = Path(path_str)
         if not p.is_absolute():
-            p = APP_DIR / p
+            p = _app_root() / p
         fid      = QFontDatabase.addApplicationFont(str(p))
         families = QFontDatabase.applicationFontFamilies(fid)
         if families:
             f = QFont(families[0])
+            # Some bundled fonts, such as msyhbd.ttc, provide only a bold
+            # face. Preserve that face instead of requesting a missing Normal
+            # variant and allowing Qt to substitute another font.
+            styles = QFontDatabase.styles(families[0])
+            if styles:
+                f.setStyleName(styles[0])
             f.setPixelSize(size)
-            f.setWeight(weight)
+            if weight != QFont.Weight.Normal:
+                f.setWeight(weight)
             return f
     f = QFont()
     f.setPixelSize(size)
@@ -341,8 +420,10 @@ class LyricsCanvas(QWidget):
     # ── Config & fonts ──
 
     def apply_cfg(self, cfg: dict) -> None:
-        prev = self._cfg
-        self._cfg = cfg
+        # Keep independent snapshots so in-place updates to a config dict still
+        # trigger font and pixmap rebuilds.
+        prev = dict(self._cfg)
+        self._cfg = dict(cfg)
         font_changed = (
             cfg.get("font_jp")      != prev.get("font_jp")      or
             cfg.get("font_zh")      != prev.get("font_zh")      or
@@ -355,9 +436,16 @@ class LyricsCanvas(QWidget):
             cfg.get("color_sung")   != prev.get("color_sung")   or
             cfg.get("color_unsung") != prev.get("color_unsung") or
             cfg.get("color_zh")     != prev.get("color_zh")     or
-            cfg.get("text_shadow")  != prev.get("text_shadow")  or
+            cfg.get("shadow_enabled") != prev.get("shadow_enabled") or
+            cfg.get("shadow_color")   != prev.get("shadow_color")   or
+            cfg.get("shadow_opacity") != prev.get("shadow_opacity") or
+            cfg.get("shadow_blur")    != prev.get("shadow_blur")    or
+            cfg.get("shadow_dx")      != prev.get("shadow_dx")      or
+            cfg.get("shadow_dy")      != prev.get("shadow_dy")      or
             cfg.get("spacing_rt")   != prev.get("spacing_rt")   or
-            cfg.get("spacing_zh")   != prev.get("spacing_zh")
+            cfg.get("spacing_zh")   != prev.get("spacing_zh")   or
+            cfg.get("align_h")      != prev.get("align_h")      or
+            cfg.get("align_v")      != prev.get("align_v")
         )
         if font_changed:
             self._rebuild_fonts()
@@ -375,7 +463,7 @@ class LyricsCanvas(QWidget):
         zh_p  = cfg.get("font_zh", "")
         self._font_jp = _load_qt_font(jp_p, sz_jp, QFont.Weight.DemiBold)
         self._font_rt = _load_qt_font(jp_p, sz_rt, QFont.Weight.DemiBold)
-        self._font_zh = _load_qt_font(zh_p, sz_zh, QFont.Weight.Normal)
+        self._font_zh = _load_qt_font(zh_p, sz_zh)
         self._fm_jp   = QFontMetricsF(self._font_jp)
         self._fm_rt   = QFontMetricsF(self._font_rt)
         self._fm_zh   = QFontMetricsF(self._font_zh)
@@ -471,29 +559,41 @@ class LyricsCanvas(QWidget):
         fm_jp   = self._fm_jp
         fm_rt   = self._fm_rt
         fm_zh   = self._fm_zh
-        rt_h    = fm_rt.ascent() + fm_rt.descent()
         gap     = float(cfg.get("spacing_rt", 2))
         spacing = float(cfg.get("spacing_zh", -8))
         has_zh  = bool(layout.zh_text)
 
-        if has_zh:
-            block_h = (rt_h + gap + fm_jp.ascent() + fm_jp.descent()
-                       + spacing + fm_zh.ascent() + fm_zh.descent())
-        else:
-            block_h = rt_h + gap + fm_jp.ascent() + fm_jp.descent()
+        align_h = cfg.get("align_h", "center")
+        align_v = cfg.get("align_v", "center")
 
-        top_y     = (H - block_h) / 2
-        rt_base_y = top_y + rt_h
-        jp_base_y = rt_base_y + gap + fm_jp.ascent()
-        zh_base_y = (jp_base_y + fm_jp.descent() + spacing + fm_zh.ascent()
-                     if has_zh else 0.0)
+        # Block height is always computed as if all three layers (ruby / jp / zh)
+        # exist, so jp_base_y stays fixed regardless of whether a particular line
+        # actually has furigana or a translation.
+        block_top    = fm_rt.ascent() + fm_rt.descent() + gap
+        block_bottom = fm_jp.descent() + spacing + fm_zh.ascent() + fm_zh.descent()
+
+        pad_v = 8.0
+        if align_v == "top":
+            jp_base_y = pad_v + block_top + fm_jp.ascent()
+        elif align_v == "bottom":
+            jp_base_y = H - pad_v - block_bottom
+        else:  # center
+            jp_base_y = (H - (block_top + fm_jp.ascent() + block_bottom)) / 2.0 + block_top + fm_jp.ascent()
+
+        rt_base_y = jp_base_y - fm_jp.ascent() - gap - fm_rt.descent()
+        zh_base_y = jp_base_y + fm_jp.descent() + spacing + fm_zh.ascent()
 
         pad   = 18.0
         avail = W - 2 * pad
         scale = min(1.0, avail / layout.total_w) if layout.total_w > 1 else 1.0
-        x_off = pad + (avail - layout.total_w * scale) / 2
+        if align_h == "left":
+            x_off = pad
+        elif align_h == "right":
+            x_off = pad + avail - layout.total_w * scale
+        else:  # center
+            x_off = pad + (avail - layout.total_w * scale) / 2
 
-        shadow       = _parse_shadow(cfg.get("text_shadow", ""))
+        shadow       = _parse_shadow(cfg)
         color_sung   = QColor(cfg.get("color_sung",   "#4fc3f7"))
         color_unsung = QColor(cfg.get("color_unsung", "#888888"))
         color_zh_c   = QColor(cfg.get("color_zh",     "#aaaaaa"))
@@ -520,16 +620,18 @@ class LyricsCanvas(QWidget):
         _apply_transform(p_u)
 
         if shadow:
-            sdx, sdy, sc = shadow
-            p_u.setPen(sc)
-            for m in layout.morae:
-                p_u.setFont(self._font_rt if m.is_rt else self._font_jp)
-                y = rt_base_y if m.is_rt else jp_base_y
-                p_u.drawText(QPointF(m.x + sdx, y + sdy), m.text)
-            if layout.kanjis:
-                p_u.setFont(self._font_jp)
-                for k in layout.kanjis:
-                    p_u.drawText(QPointF(k.x + sdx, jp_base_y + sdy), k.text)
+            for sox, soy, sa in shadow.offsets:
+                sc = QColor(shadow.color)
+                sc.setAlphaF(shadow.color.alphaF() * sa)
+                p_u.setPen(sc)
+                for m in layout.morae:
+                    p_u.setFont(self._font_rt if m.is_rt else self._font_jp)
+                    y = rt_base_y if m.is_rt else jp_base_y
+                    p_u.drawText(QPointF(m.x + sox, y + soy), m.text)
+                if layout.kanjis:
+                    p_u.setFont(self._font_jp)
+                    for k in layout.kanjis:
+                        p_u.drawText(QPointF(k.x + sox, jp_base_y + soy), k.text)
 
         p_u.setPen(color_unsung)
         for m in layout.morae:
@@ -543,14 +645,21 @@ class LyricsCanvas(QWidget):
         p_u.restore()   # pop scale/translate before drawing ZH
 
         if has_zh:
-            zh_x = (W - layout.zh_w) / 2
+            if align_h == "left":
+                zh_x = pad
+            elif align_h == "right":
+                zh_x = W - pad - layout.zh_w
+            else:
+                zh_x = (W - layout.zh_w) / 2
             zh_y = (H / 2.0 * (1.0 - scale) + zh_base_y * scale
                     if scale < 1.0 else zh_base_y)
             if shadow:
-                sdx, sdy, sc = shadow
                 p_u.setFont(self._font_zh)
-                p_u.setPen(sc)
-                p_u.drawText(QPointF(zh_x + sdx, zh_y + sdy), layout.zh_text)
+                for sox, soy, sa in shadow.offsets:
+                    sc = QColor(shadow.color)
+                    sc.setAlphaF(shadow.color.alphaF() * sa)
+                    p_u.setPen(sc)
+                    p_u.drawText(QPointF(zh_x + sox, zh_y + soy), layout.zh_text)
             p_u.setFont(self._font_zh)
             p_u.setPen(color_zh_c)
             p_u.drawText(QPointF(zh_x, zh_y), layout.zh_text)
@@ -683,6 +792,26 @@ class LyricsCanvas(QWidget):
             painter.drawPixmap(0, 0, self._px_sung[li])
 
 
+# ── Snapping double spin box ──
+class _SnapSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that snaps the current value to the nearest 0.25 multiple
+    before each step, so clicking + or - always lands on a clean 0.25 boundary."""
+
+    def stepBy(self, steps: int) -> None:
+        step = self.singleStep()
+        if step <= 0 or steps == 0:
+            super().stepBy(steps)
+            return
+        current = self.value()
+        # Snap to nearest multiple of step
+        snapped = round(round(current / step) * step, self.decimals())
+        # Then move N steps in the requested direction
+        target = snapped + step * steps
+        target = round(target, self.decimals())
+        target = max(self.minimum(), min(self.maximum(), target))
+        self.setValue(target)
+
+
 # ── Settings dialog ────
 class SettingsDialog(QDialog):
     def __init__(self, cfg: dict, parent=None, on_preview=None):
@@ -698,15 +827,21 @@ class SettingsDialog(QDialog):
     def _connect_preview(self):
         if not self._on_preview:
             return
-        self.font_size_jp.valueChanged.connect(self._preview)
-        self.font_size_rt.valueChanged.connect(self._preview)
-        self.font_size_zh.valueChanged.connect(self._preview)
+        self.font_jp_w._edit.textChanged.connect(self._preview)
+        self.font_zh_w._edit.textChanged.connect(self._preview)
+        # font_size_* は _on_font_manual / _on_scale 内で _preview() を呼ぶ
         self.spacing_rt.valueChanged.connect(self._preview)
         self.spacing_zh.valueChanged.connect(self._preview)
         self.opacity.valueChanged.connect(self._preview)
         self.hide_pause.toggled.connect(self._preview)
         self.unlock_zone.valueChanged.connect(self._preview)
-        self.text_shadow.textChanged.connect(self._preview)
+        self.shadow_enabled.toggled.connect(self._preview)
+        self.shadow_opacity.valueChanged.connect(self._preview)
+        self.shadow_blur.valueChanged.connect(self._preview)
+        self.shadow_dx.valueChanged.connect(self._preview)
+        self.shadow_dy.valueChanged.connect(self._preview)
+        self.align_h.currentIndexChanged.connect(self._preview)
+        self.align_v.currentIndexChanged.connect(self._preview)
 
     def _preview(self, *_):
         if self._on_preview:
@@ -726,14 +861,72 @@ class SettingsDialog(QDialog):
         self.font_size_zh = QSpinBox(); self.font_size_zh.setRange(8, 96); self.font_size_zh.setSuffix(" px"); self.font_size_zh.setValue(self.cfg["font_size_zh"])
         self.spacing_rt   = QSpinBox(); self.spacing_rt.setRange(-30, 60); self.spacing_rt.setSuffix(" px"); self.spacing_rt.setValue(self.cfg.get("spacing_rt", 2))
         self.spacing_zh   = QSpinBox(); self.spacing_zh.setRange(-60, 60); self.spacing_zh.setSuffix(" px"); self.spacing_zh.setValue(self.cfg["spacing_zh"])
+
+        # 総合サイズ: ＋／－ボタンで全フォント・間距を等比率で拡縮する
+        # 浮点精度を保つために内部変数で実数値を管理し、スピンボックスには丸めた値のみ表示する
+        self._sz_jp  = float(self.cfg["font_size_jp"])
+        self._sz_rt  = float(self.cfg.get("font_size_rt", max(8, self.cfg["font_size_jp"] // 2)))
+        self._sz_zh  = float(self.cfg["font_size_zh"])
+        self._sp_rt  = float(self.cfg.get("spacing_rt", 2))
+        self._sp_zh  = float(self.cfg["spacing_zh"])
+        _STEP = 1.05  # 1クリックで約5%拡縮
+
+        def _scale_all(factor: float):
+            self._sz_jp = max(8.0,  self._sz_jp * factor)
+            self._sz_rt = max(6.0,  self._sz_rt * factor)
+            self._sz_zh = max(8.0,  self._sz_zh * factor)
+            self._sp_rt = self._sp_rt * factor
+            self._sp_zh = self._sp_zh * factor
+            for w, v, lo in [
+                (self.font_size_jp, self._sz_jp, 8),
+                (self.font_size_rt, self._sz_rt, 6),
+                (self.font_size_zh, self._sz_zh, 8),
+                (self.spacing_rt,   self._sp_rt, -30),
+                (self.spacing_zh,   self._sp_zh, -60),
+            ]:
+                w.blockSignals(True)
+                w.setValue(max(lo, round(v)))
+                w.blockSignals(False)
+            self._preview()
+
+        def _sync_internal(*_):
+            # 個別手動変更時は内部変数をスピンボックスの値に同期する
+            self._sz_jp = float(self.font_size_jp.value())
+            self._sz_rt = float(self.font_size_rt.value())
+            self._sz_zh = float(self.font_size_zh.value())
+            self._sp_rt = float(self.spacing_rt.value())
+            self._sp_zh = float(self.spacing_zh.value())
+            self._preview()
+
+        self.font_size_jp.valueChanged.connect(_sync_internal)
+        self.font_size_rt.valueChanged.connect(_sync_internal)
+        self.font_size_zh.valueChanged.connect(_sync_internal)
+        self.spacing_rt.valueChanged.connect(_sync_internal)
+        self.spacing_zh.valueChanged.connect(_sync_internal)
+
+        btn_scale_dec = QPushButton("－")
+        btn_scale_inc = QPushButton("＋")
+        for b in (btn_scale_dec, btn_scale_inc):
+            b.setFixedSize(32, 24)
+        btn_scale_dec.clicked.connect(lambda: _scale_all(1.0 / _STEP))
+        btn_scale_inc.clicked.connect(lambda: _scale_all(_STEP))
+        scale_row = QWidget()
+        scale_lay = QHBoxLayout(scale_row)
+        scale_lay.setContentsMargins(0, 0, 0, 0)
+        scale_lay.setSpacing(4)
+        scale_lay.addWidget(btn_scale_dec)
+        scale_lay.addWidget(btn_scale_inc)
+        scale_lay.addStretch()
+
         # 設定画面の表示名は日本語で統一すること。
-        f1.addRow("振り仮名サイズ", self.font_size_rt)
+        f1.addRow("総合サイズ",           scale_row)
+        f1.addRow("振り仮名サイズ",       self.font_size_rt)
         f1.addRow("振り仮名と日本語の間隔", self.spacing_rt)
-        f1.addRow("日本語フォント",      self.font_jp_w)
-        f1.addRow("中国語フォント",         self.font_zh_w)
-        f1.addRow("日本語フォントサイズ", self.font_size_jp)
-        f1.addRow("中国語フォントサイズ",   self.font_size_zh)
-        f1.addRow("日中間距(px)",         self.spacing_zh)
+        f1.addRow("日本語フォント",        self.font_jp_w)
+        f1.addRow("中国語フォント",        self.font_zh_w)
+        f1.addRow("日本語フォントサイズ",  self.font_size_jp)
+        f1.addRow("中国語フォントサイズ",  self.font_size_zh)
+        f1.addRow("日中間距(px)",          self.spacing_zh)
         tabs.addTab(w1, "表示")
         w2  = QWidget()
         f2  = QFormLayout(w2)
@@ -741,14 +934,45 @@ class SettingsDialog(QDialog):
         self.btn_unsung = self._color_btn(self.cfg["color_unsung"])
         self.btn_zh     = self._color_btn(self.cfg["color_zh"])
         self.opacity    = QDoubleSpinBox(); self.opacity.setRange(0.1, 1.0); self.opacity.setSingleStep(0.05); self.opacity.setValue(self.cfg["opacity"])
-        self.text_shadow = QLineEdit(self.cfg.get("text_shadow", ""))
-        self.text_shadow.setPlaceholderText("例: 2px 2px 8px rgba(0,0,0,0.85)  ※空欄で無効")
-        self.text_shadow.setMinimumWidth(260)
+
+        # Shadow controls
+        self.shadow_enabled = QCheckBox()
+        self.shadow_enabled.setChecked(self.cfg.get("shadow_enabled", True))
+        self.btn_shadow = self._color_btn(self.cfg.get("shadow_color", "#000000"))
+        self.shadow_opacity = _SnapSpinBox()
+        self.shadow_opacity.setRange(0.0, 1.0)
+        self.shadow_opacity.setDecimals(2)
+        self.shadow_opacity.setSingleStep(0.25)
+        self.shadow_opacity.setValue(self.cfg.get("shadow_opacity", 0.85))
+        self.shadow_blur = _SnapSpinBox()
+        self.shadow_blur.setRange(0.0, 40.0)
+        self.shadow_blur.setDecimals(2)
+        self.shadow_blur.setSingleStep(0.25)
+        self.shadow_blur.setSuffix(" px")
+        self.shadow_blur.setValue(float(self.cfg.get("shadow_blur", 8)))
+        self.shadow_dx = _SnapSpinBox()
+        self.shadow_dx.setRange(-20.0, 20.0)
+        self.shadow_dx.setDecimals(2)
+        self.shadow_dx.setSingleStep(0.25)
+        self.shadow_dx.setSuffix(" px")
+        self.shadow_dx.setValue(self.cfg.get("shadow_dx", 2))
+        self.shadow_dy = _SnapSpinBox()
+        self.shadow_dy.setRange(-20.0, 20.0)
+        self.shadow_dy.setDecimals(2)
+        self.shadow_dy.setSingleStep(0.25)
+        self.shadow_dy.setSuffix(" px")
+        self.shadow_dy.setValue(self.cfg.get("shadow_dy", 2))
+
         f2.addRow("歌唱色",         self.btn_sung)
         f2.addRow("未歌唱色",       self.btn_unsung)
         f2.addRow("訳文色",         self.btn_zh)
         f2.addRow("透明度",         self.opacity)
-        f2.addRow("テキストシャドウ", self.text_shadow)
+        f2.addRow("シャドウ 有効",   self.shadow_enabled)
+        f2.addRow("シャドウ 色",     self.btn_shadow)
+        f2.addRow("シャドウ 不透明度", self.shadow_opacity)
+        f2.addRow("シャドウ ぼかし", self.shadow_blur)
+        f2.addRow("シャドウ X方向",  self.shadow_dx)
+        f2.addRow("シャドウ Y方向",  self.shadow_dy)
         tabs.addTab(w2, "色彩")
 
         w3  = QWidget()
@@ -761,6 +985,24 @@ class SettingsDialog(QDialog):
         f3.addRow("停止時に隠す",       self.hide_pause)
         f3.addRow("解錠ゾーンサイズ",   self.unlock_zone)
         tabs.addTab(w3, "動作")
+
+        from PyQt6.QtWidgets import QComboBox
+        w4 = QWidget()
+        f4 = QFormLayout(w4)
+
+        self.align_h = QComboBox()
+        self.align_h.addItems(["左揃え", "中央揃え", "右揃え"])
+        _ah_map  = {"left": 0, "center": 1, "right": 2}
+        self.align_h.setCurrentIndex(_ah_map.get(self.cfg.get("align_h", "center"), 1))
+
+        self.align_v = QComboBox()
+        self.align_v.addItems(["上揃え", "中央揃え", "下揃え"])
+        _av_map  = {"top": 0, "center": 1, "bottom": 2}
+        self.align_v.setCurrentIndex(_av_map.get(self.cfg.get("align_v", "center"), 1))
+
+        f4.addRow("水平位置", self.align_h)
+        f4.addRow("垂直位置", self.align_v)
+        tabs.addTab(w4, "レイアウト")
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self.accept)
@@ -819,9 +1061,16 @@ class SettingsDialog(QDialog):
             "color_unsung":  self.btn_unsung._color,
             "color_zh":      self.btn_zh._color,
             "opacity":       self.opacity.value(),
-            "hide_on_pause": self.hide_pause.isChecked(),
-            "unlock_zone":   self.unlock_zone.value(),
-            "text_shadow":   self.text_shadow.text(),
+            "hide_on_pause":   self.hide_pause.isChecked(),
+            "unlock_zone":     self.unlock_zone.value(),
+            "shadow_enabled":  self.shadow_enabled.isChecked(),
+            "shadow_color":    self.btn_shadow._color,
+            "shadow_opacity":  self.shadow_opacity.value(),
+            "shadow_blur":     self.shadow_blur.value(),
+            "shadow_dx":       self.shadow_dx.value(),
+            "shadow_dy":       self.shadow_dy.value(),
+            "align_h":         ["left", "center", "right"][self.align_h.currentIndex()],
+            "align_v":         ["top",  "center", "bottom"][self.align_v.currentIndex()],
         }
 
 
@@ -902,9 +1151,10 @@ def _screen_relative_defaults() -> dict:
     if not screen:
         return {}
     g = screen.availableGeometry()
-    w = max(480, min(g.width() // 2, 900))
-    h = max(180, g.height() // 5)
-    return dict(x=g.x() + (g.width() - w) // 2, y=g.bottom() - h - 80, w=w, h=h)
+    w = min(DEFAULT_CFG["w"], g.width())
+    h = min(DEFAULT_CFG["h"], g.height())
+    return dict(x=g.x() + (g.width() - w) // 2, y=g.y() + (g.height() - h) // 2,
+                w=w, h=h)
 
 
 # ── Main window ──

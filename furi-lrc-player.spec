@@ -1,15 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_submodules, collect_all
 
-datas = [('furi-lrc_rubi.py', '.'), ('fonts', 'fonts'), ('settings.json', '.')]
+datas = [
+    ('fonts', 'fonts'),
+    ('data-player/icon-player.ico', 'data-player'),
+    # Loaded through importlib at runtime; make it available in _MEIPASS.
+    ('furi-lrc_rubi.py', '.'),
+]
 binaries = []
-hiddenimports = ['PyQt6.QtMultimedia', 'PyQt6.QtMultimediaWidgets']
+# furi-lrc_rubi.py is dynamically loaded, so PyInstaller cannot analyse its
+# imports from the entry point.
+hiddenimports = [
+    'PyQt6.QtMultimedia', 'PyQt6.QtMultimediaWidgets',
+    'asyncio', 'ctypes', 'datetime', 're', 'threading', 'time',
+]
 hiddenimports += collect_submodules('mutagen')
-hiddenimports += collect_submodules('winsdk')
 tmp_ret = collect_all('PyQt6')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-
 
 a = Analysis(
     ['furi-lrc-player.py'],
@@ -42,6 +49,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='icon-player.ico',
 )
 coll = COLLECT(
     exe,

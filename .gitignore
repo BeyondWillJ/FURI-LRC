@@ -5,3 +5,7 @@
 *.mp4
 /build
 /dist
+*.7z
+*.zip
+*.tar.gz
+*.rar
