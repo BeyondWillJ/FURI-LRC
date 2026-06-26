@@ -2,8 +2,8 @@
   "tracks": [
     {
       "path": "E:/日语/日语/main/Homework/FURI-LRC/夜に駆ける.mp3",
-      "lyrics": "E:/日语/日语/main/Homework/FURI-LRC/yoru-ni-kakeru.json",
-      "offset_ms": 500
+      "lyrics": "E:/日语/日语/main/Homework/FURI-LRC/flrc/yoru-ni-kakeru.flrc",
+      "offset_ms": 400
     },
     {
       "path": "E:/日语/日语/main/Homework/FURI-LRC/扉をあけて.mp3",
@@ -18,7 +18,7 @@
   ],
   "current": 1,
   "loop_mode": 2,
-  "position_ms": 8621,
+  "position_ms": 31217,
   "volume": 0.5635135135135135,
   "playing": false,
   "shuffle_history": []
