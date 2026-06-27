@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QDialog,
     QFormLayout, QLineEdit, QDialogButtonBox, QTabWidget,
     QDoubleSpinBox, QColorDialog, QPushButton, QFileDialog,
-    QSpinBox, QCheckBox, QSlider, QLabel, QGroupBox,
+    QSpinBox, QCheckBox, QSlider, QLabel, QGroupBox, QComboBox,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, pyqtSignal, QObject, QPoint, QPointF, QRectF, QRect,
@@ -37,7 +37,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor, QCursor, QPainter, QPen, QFontDatabase, QFont, QFontMetricsF,
-    QPixmap,
+    QPixmap, QRawFont, QFontInfo,
 )
 
 # ── winrt SMTC (optional) ───
@@ -86,6 +86,54 @@ DEFAULT_CFG = dict(
     align_h="right",   # "left" | "center" | "right"
     align_v="bottom",  # "top"  | "center" | "bottom"
 )
+
+
+def _fit_file_dialog(dlg: QFileDialog, width: int = 640, height: int = 420) -> None:
+    screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+    if not screen:
+        dlg.resize(width, height)
+        return
+    avail = screen.availableGeometry()
+    w = min(width, max(520, int(avail.width() * 0.62)))
+    h = min(height, max(340, int(avail.height() * 0.58)))
+    dlg.resize(w, h)
+    frame = dlg.frameGeometry()
+    frame.moveCenter(avail.center())
+    dlg.move(frame.topLeft())
+
+
+def _make_file_dialog_address_editable(dlg: QFileDialog) -> None:
+    combo = dlg.findChild(QComboBox, "lookInCombo")
+    if combo is None:
+        return
+    combo.setEditable(True)
+    edit = combo.lineEdit()
+    if edit is None:
+        return
+    edit.setClearButtonEnabled(True)
+
+    def navigate_from_combo():
+        text = edit.text().strip().strip('"')
+        if not text:
+            return
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = Path(dlg.directory().absolutePath()) / path
+        if path.is_dir():
+            dlg.setDirectory(str(path))
+        elif path.parent.is_dir():
+            dlg.setDirectory(str(path.parent))
+            dlg.selectFile(path.name)
+
+    edit.returnPressed.connect(navigate_from_combo)
+
+
+def _prepare_file_dialog(dlg: QFileDialog, width: int = 640, height: int = 420) -> None:
+    dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+    dlg.setViewMode(QFileDialog.ViewMode.Detail)
+    dlg.setSizeGripEnabled(True)
+    _make_file_dialog_address_editable(dlg)
+    _fit_file_dialog(dlg, width, height)
 
 
 def _migrate_shadow(cfg: dict) -> dict:
@@ -291,29 +339,216 @@ def _parse_shadow(cfg: dict) -> Optional["_ShadowCfg"]:
     return _ShadowCfg(dx=dx, dy=dy, blur=blur, color=c, offsets=offsets)
 
 
+@dataclasses.dataclass(frozen=True)
+class _FontFace:
+    family: str
+    style: str = ""
+    weight: Optional[int] = None
+
+
+_FONT_EXACT_FACE_CACHE: dict = {}
+
+
+def _infer_weight_from_style(style: str) -> Optional[int]:
+    normalized = re.sub(r"[\s_-]+", "", style or "").lower()
+    if not normalized:
+        return None
+    if "thin" in normalized:
+        return 100
+    if "extralight" in normalized or "ultralight" in normalized:
+        return 200
+    if "light" in normalized:
+        return 300
+    if "regular" in normalized or "normal" in normalized or "book" in normalized:
+        return 400
+    if "medium" in normalized:
+        return 500
+    if "semibold" in normalized or "demibold" in normalized:
+        return 600
+    if "extrabold" in normalized or "ultrabold" in normalized:
+        return 800
+    if "black" in normalized or "heavy" in normalized:
+        return 900
+    if "bold" in normalized:
+        return 700
+    return None
+
+
+def _resolve_font_face(abs_path: str) -> Optional[_FontFace]:
+    """Register a font file once and return the exact family/style face."""
+    if abs_path in _FONT_EXACT_FACE_CACHE:
+        return _FONT_EXACT_FACE_CACHE[abs_path]
+
+    fid = QFontDatabase.addApplicationFont(abs_path)
+    if fid < 0:
+        _FONT_EXACT_FACE_CACHE[abs_path] = None
+        return None
+    families = QFontDatabase.applicationFontFamilies(fid)
+    if not families:
+        _FONT_EXACT_FACE_CACHE[abs_path] = None
+        return None
+
+    family = families[0]
+    style = ""
+    weight = None
+    try:
+        raw = QRawFont(abs_path, 16.0)
+        raw_family = raw.familyName()
+        raw_style = raw.styleName()
+        raw_weight = raw.weight()
+        if raw_family and raw_family in families:
+            family = raw_family
+        if raw_style:
+            style = raw_style
+        inferred_weight = _infer_weight_from_style(raw_style)
+        if raw_weight > 0:
+            weight = int(raw_weight)
+            if raw_weight == 400 and inferred_weight not in (None, 400):
+                weight = inferred_weight
+        elif inferred_weight:
+            weight = inferred_weight
+    except Exception:
+        pass
+
+    # QRawFont returns no usable metadata for TrueType Collections (.ttc):
+    # an empty style and a default weight of 400, which silently drops a bold
+    # face's real weight (e.g. msyhbd.ttc reads back as weight 400 instead of
+    # 700).  A family-only QFont request at weight 400 then binds to whatever
+    # face the global font database happens to offer, so switching another
+    # font — which re-registers fonts and perturbs that state — can flip this
+    # one to a thinner weight.  Recover style/weight from the font database,
+    # the only reliable source for these files, to make the request explicit.
+    if not style:
+        db_styles = QFontDatabase.styles(family)
+        if db_styles:
+            style = db_styles[0]
+            if weight in (None, 400):
+                db_weight = QFontDatabase.weight(family, style)
+                weight = db_weight if db_weight > 0 else (
+                    _infer_weight_from_style(style) or weight)
+
+    if weight is None and style:
+        weight = _infer_weight_from_style(style)
+
+    face = _FontFace(family=family, style=style, weight=weight)
+    _FONT_EXACT_FACE_CACHE[abs_path] = face
+    return face
+
+
+def _lock_font_to_requested_face(f: QFont) -> QFont:
+    f.setStyleStrategy(
+        QFont.StyleStrategy.PreferMatch |
+        QFont.StyleStrategy.NoFontMerging |
+        QFont.StyleStrategy.ForceOutline
+    )
+    return f
+
+
+def _weight_enum_value(weight: QFont.Weight) -> int:
+    return int(weight.value if hasattr(weight, "value") else weight)
+
+
+def _weight_from_number(weight: Optional[int],
+                        default: QFont.Weight = QFont.Weight.Normal) -> QFont.Weight:
+    if weight is None or weight <= 0:
+        return default
+    if weight >= 900:
+        return QFont.Weight.Black
+    if weight >= 800:
+        return QFont.Weight.ExtraBold
+    if weight >= 700:
+        return QFont.Weight.Bold
+    if weight >= 600:
+        return QFont.Weight.DemiBold
+    if weight >= 500:
+        return QFont.Weight.Medium
+    if weight <= 200:
+        return QFont.Weight.ExtraLight
+    if weight <= 300:
+        return QFont.Weight.Light
+    return QFont.Weight.Normal
+
+
+def _font_matches_face(font: QFont, face: _FontFace, target_weight: QFont.Weight) -> bool:
+    info = QFontInfo(font)
+    target_weight_value = _weight_enum_value(target_weight)
+    if face.weight and target_weight_value >= 600 and info.weight() < 600:
+        return False
+    if face.style and face.style.lower() not in info.styleName().lower():
+        return False
+    return True
+
+
+def _finalize_font_candidate(f: QFont, face: _FontFace, size: int,
+                             target_weight: QFont.Weight) -> QFont:
+    try:
+        f.setFamilies([face.family])
+    except Exception:
+        pass
+    f.setFamily(face.family)
+    if face.style:
+        f.setStyleName(face.style)
+    f.setPixelSize(size)
+    if _weight_enum_value(target_weight) >= 700:
+        f.setBold(True)
+    f.setWeight(target_weight)
+    if face.style:
+        f.setStyleName(face.style)
+    return _lock_font_to_requested_face(f)
+
+
+def _font_from_face(face: _FontFace, size: int, default_weight: QFont.Weight) -> QFont:
+    target_weight = _weight_from_number(face.weight, default_weight)
+    candidates: List[QFont] = []
+    if face.style:
+        candidates.append(QFontDatabase.font(face.family, face.style, size))
+    direct = QFont(face.family)
+    if face.style:
+        direct.setStyleName(face.style)
+    candidates.append(direct)
+
+    last = candidates[-1]
+    for f in candidates:
+        f = _finalize_font_candidate(f, face, size, target_weight)
+        if _font_matches_face(f, face, target_weight):
+            return f
+        last = f
+    return last
+
+
+def _resolve_face_from_path(path_str: str) -> Optional[_FontFace]:
+    if not path_str:
+        return None
+    p = Path(path_str)
+    if not p.is_absolute():
+        p = _app_root() / p
+    if not p.exists():
+        return None
+    return _resolve_font_face(str(p))
+
+
 def _load_qt_font(path_str: str, size: int,
                   weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
-    if path_str:
-        p = Path(path_str)
-        if not p.is_absolute():
-            p = _app_root() / p
-        fid      = QFontDatabase.addApplicationFont(str(p))
-        families = QFontDatabase.applicationFontFamilies(fid)
-        if families:
-            f = QFont(families[0])
-            # Some bundled fonts, such as msyhbd.ttc, provide only a bold
-            # face. Preserve that face instead of requesting a missing Normal
-            # variant and allowing Qt to substitute another font.
-            styles = QFontDatabase.styles(families[0])
-            if styles:
-                f.setStyleName(styles[0])
-            f.setPixelSize(size)
-            if weight != QFont.Weight.Normal:
-                f.setWeight(weight)
-            return f
+    face = _resolve_face_from_path(path_str)
+    if face is None:
+        # Fall back to a bundled typeface so the overlay never depends on a
+        # system-installed font — it keeps working on a machine that has no
+        # fonts of its own, as long as ./fonts ships with the app.
+        for fallback in (DEFAULT_CFG.get("font_jp"), DEFAULT_CFG.get("font_zh")):
+            face = _resolve_face_from_path(fallback)
+            if face is not None:
+                break
+    if face is not None:
+        return _font_from_face(face, size, weight)
     f = QFont()
     f.setPixelSize(size)
     f.setWeight(weight)
+    return _lock_font_to_requested_face(f)
+
+
+def _clone_qt_font_with_size(font: QFont, size: int) -> QFont:
+    f = QFont(font)
+    f.setPixelSize(size)
     return f
 
 
@@ -461,8 +696,8 @@ class LyricsCanvas(QWidget):
         sz_zh = cfg.get("font_size_zh", 14)
         jp_p  = cfg.get("font_jp", "")
         zh_p  = cfg.get("font_zh", "")
-        self._font_jp = _load_qt_font(jp_p, sz_jp, QFont.Weight.DemiBold)
-        self._font_rt = _load_qt_font(jp_p, sz_rt, QFont.Weight.DemiBold)
+        self._font_jp = _load_qt_font(jp_p, sz_jp)
+        self._font_rt = _clone_qt_font_with_size(self._font_jp, sz_rt)
         self._font_zh = _load_qt_font(zh_p, sz_zh)
         self._fm_jp   = QFontMetricsF(self._font_jp)
         self._fm_rt   = QFontMetricsF(self._font_rt)
@@ -1034,13 +1269,17 @@ class SettingsDialog(QDialog):
         btn = QPushButton("…")
         btn.setFixedWidth(28)
         def browse():
-            p, _ = QFileDialog.getOpenFileName(
+            dlg = QFileDialog(
                 self, "フォントファイルを選択",
                 str(FONTS_DIR),
                 "Font Files (*.ttf *.otf *.ttc *.woff2 *.woff)"
             )
-            if p:
-                edit.setText(p)
+            dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
+            _prepare_file_dialog(dlg, 620, 400)
+            if dlg.exec():
+                files = dlg.selectedFiles()
+                if files:
+                    edit.setText(files[0])
         btn.clicked.connect(browse)
         lay.addWidget(edit)
         lay.addWidget(btn)
@@ -1456,8 +1695,7 @@ class LyricWindow(QWidget):
         dlg = QFileDialog(self, "歌詞ファイルを選択")
         dlg.setNameFilter("JSON Files (*.json)")
         dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        dlg.resize(560, 380)
+        _prepare_file_dialog(dlg, 560, 380)
         if dlg.exec():
             files = dlg.selectedFiles()
             if files:

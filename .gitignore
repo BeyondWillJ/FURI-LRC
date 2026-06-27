@@ -9,3 +9,5 @@
 *.zip
 *.tar.gz
 *.rar
+settings.json
+*.flpl

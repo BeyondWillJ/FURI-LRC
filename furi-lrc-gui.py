@@ -2140,47 +2140,57 @@ def _mk_check(label: str, checked: bool):
 
 class BatchTranslateDialog(QDialog):
     """
-    一括翻訳編集ダイアログ。
+    一括翻訳編集ダイアログ（強化版）
 
-    左列: 日本語原文（読み取り専用）
-    右列: 中文訳（直接入力可）
-
-    OK で確定、キャンセル時は未保存変更があれば確認を求める。
+    左ペイン : JP/ZH対応テーブル（複数行選択・直接入力可）
+    右ペイン : 一括貼り付けパネル
+                - ZH字幕を改行区切りで貼り付け → テーブルに一括適用
+                - 配置モード: 行1から / 選択行から / 空行のみ
+                - 貼り付け側の空行スキップ / 既存ZH上書きオプション
+    下ボタン : ZH↑/ZH↓（選択行ZHを上下にシフト）、ZH消去
     """
 
     def __init__(self, lines: list, parent=None):
         super().__init__(parent)
         self.setWindowTitle("一括翻訳編集")
         self.setModal(True)
-        self.resize(760, 520)
-        # Deep-copy so edits are isolated until OK is pressed
+        self.resize(1060, 560)
         self._lines = lines
-        self._result: Optional[list] = None   # set to edited zh list on accept
+        self._result: Optional[list] = None
         self._dirty = False
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
 
-        hint = QLabel("左列: 日本語原文（編集不可）　右列: 中文訳（直接入力）")
+        hint = QLabel(
+            "左列: 日本語原文（編集不可）　右列: 中文訳（直接入力 / 複数行選択→右パネルで一括操作）"
+        )
         hint.setStyleSheet("color:#555;font-size:11px;")
         layout.addWidget(hint)
 
+        # ── 水平スプリッタ: テーブル | 貼り付けパネル ──
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # ── 左: テーブル + ZH シフトボタン ──
+        table_widget = QWidget()
+        table_lay = QVBoxLayout(table_widget)
+        table_lay.setContentsMargins(0, 0, 4, 0)
+        table_lay.setSpacing(4)
+
         self._table = QTableWidget(len(self._lines), 2)
         self._table.setHorizontalHeaderLabels(["日本語 (JP)", "中文訳 (ZH)"])
-        self._table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
-        self._table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
-        )
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setDefaultSectionSize(30)
+        self._table.setTabKeyNavigation(True)
 
         jp_font = QFont(_NOTO_JP or "", 12)
-        zh_font = QFont("Microsoft YaHei", 12)
+        self._zh_font = QFont("Microsoft YaHei", 12)
 
         for row, line in enumerate(self._lines):
             jp_text = segments_to_display_text(line.get('jp', []))
@@ -2192,13 +2202,123 @@ class BatchTranslateDialog(QDialog):
             self._table.setItem(row, 0, jp_item)
 
             zh_item = QTableWidgetItem(line.get('zh', ''))
-            zh_item.setFont(zh_font)
+            zh_item.setFont(self._zh_font)
             self._table.setItem(row, 1, zh_item)
 
         self._table.itemChanged.connect(self._on_cell_changed)
-        layout.addWidget(self._table, 1)
+        self._table.selectionModel().selectionChanged.connect(self._on_selection_changed)
+        table_lay.addWidget(self._table, 1)
 
-        # Button row
+        # ZH 移動／消去ボタン行
+        move_row = QHBoxLayout()
+        self._sel_label = QLabel("（行を選択してください）")
+        self._sel_label.setStyleSheet("color:#777;font-size:11px;")
+        move_row.addWidget(self._sel_label)
+        move_row.addStretch()
+        for text, tip, fn in (
+            ("ZH ↑", "選択行のZH訳を1行上に移動（上の行と循環入れ替え）", self._shift_zh_up),
+            ("ZH ↓", "選択行のZH訳を1行下に移動（下の行と循環入れ替え）", self._shift_zh_down),
+            ("ZH 消去", "選択行のZH訳をすべて消去", self._clear_selected_zh),
+        ):
+            btn = QPushButton(text)
+            btn.setToolTip(tip)
+            btn.setFixedHeight(28)
+            btn.clicked.connect(fn)
+            move_row.addWidget(btn)
+        table_lay.addLayout(move_row)
+        splitter.addWidget(table_widget)
+
+        # ── 右: 一括貼り付けパネル ──
+        paste_widget = QWidget()
+        paste_widget.setMinimumWidth(230)
+        paste_lay = QVBoxLayout(paste_widget)
+        paste_lay.setContentsMargins(4, 0, 0, 0)
+        paste_lay.setSpacing(6)
+
+        paste_title = QLabel("一括貼り付け")
+        paste_title.setStyleSheet("font-weight:bold;color:#222;font-size:13px;")
+        paste_lay.addWidget(paste_title)
+
+        paste_hint = QLabel(
+            "ZH字幕を改行区切りで貼り付け。\n"
+            "行数が一致しなくても問題ありません。"
+        )
+        paste_hint.setStyleSheet("color:#666;font-size:11px;")
+        paste_hint.setWordWrap(True)
+        paste_lay.addWidget(paste_hint)
+
+        self._paste_edit = QTextEdit()
+        self._paste_edit.setFont(QFont("Microsoft YaHei", 11))
+        self._paste_edit.setPlaceholderText(
+            "ここに複数行のZH字幕を貼り付け…\n\n"
+            "例:\n"
+            "第一行的翻译\n"
+            "第二行的翻译\n"
+            "（空行は空白ZHとして扱われます）"
+        )
+        self._paste_edit.textChanged.connect(self._update_paste_count)
+        paste_lay.addWidget(self._paste_edit, 1)
+
+        self._paste_count_lbl = QLabel("貼り付け行数: 0 行")
+        self._paste_count_lbl.setStyleSheet("color:#999;font-size:10px;")
+        paste_lay.addWidget(self._paste_count_lbl)
+
+        # 配置オプション
+        opt_grp = QGroupBox("配置オプション")
+        opt_lay = QVBoxLayout(opt_grp)
+        opt_lay.setSpacing(5)
+
+        opt_lay.addWidget(QLabel("開始位置:"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItems([
+            "行 1 から配置",
+            "選択行から配置",
+            "空行のみ埋める（全体）",
+        ])
+        self._mode_combo.setToolTip(
+            "行1から: 貼り付け1行目 → テーブル行1\n"
+            "選択行から: 選択中の最上行から配置\n"
+            "空行のみ: ZHが空の行に順番に埋める"
+        )
+        opt_lay.addWidget(self._mode_combo)
+
+        self._overwrite_check = _mk_check("既存のZHを上書き", True)
+        self._overwrite_check.setToolTip("オフにすると、ZH入力済みの行はスキップします")
+        opt_lay.addWidget(self._overwrite_check)
+
+        self._skip_empty_paste_check = _mk_check("貼り付け側の空行をスキップ", False)
+        self._skip_empty_paste_check.setToolTip(
+            "オンにすると、貼り付けテキストの空行を無視して詰めて配置します"
+        )
+        opt_lay.addWidget(self._skip_empty_paste_check)
+        paste_lay.addWidget(opt_grp)
+
+        # 適用ボタン
+        btn_apply = QPushButton("▼  適用")
+        btn_apply.setStyleSheet(
+            "QPushButton{background:#2e6fa0;color:white;border-radius:5px;"
+            "font-size:13px;font-weight:bold;}"
+            "QPushButton:hover{background:#3a88c0;}"
+        )
+        btn_apply.setFixedHeight(38)
+        btn_apply.setToolTip("貼り付けテキストをテーブルのZH列に適用 (Ctrl+Enter)")
+        btn_apply.clicked.connect(self._apply_paste)
+        paste_lay.addWidget(btn_apply)
+
+        # Ctrl+Enter shortcut for apply
+        sc_apply = QShortcut(QKeySequence("Ctrl+Return"), self)
+        sc_apply.activated.connect(self._apply_paste)
+
+        btn_clear_paste = QPushButton("貼り付けエリアを消去")
+        btn_clear_paste.setStyleSheet("color:#888;")
+        btn_clear_paste.clicked.connect(self._paste_edit.clear)
+        paste_lay.addWidget(btn_clear_paste)
+
+        splitter.addWidget(paste_widget)
+        splitter.setSizes([660, 370])
+        layout.addWidget(splitter, 1)
+
+        # OK / キャンセル
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -2206,12 +2326,124 @@ class BatchTranslateDialog(QDialog):
         bb.rejected.connect(self._on_cancel)
         layout.addWidget(bb)
 
-        # Tab moves between ZH cells only
-        self._table.setTabKeyNavigation(True)
+    # ── シグナルハンドラ ──
 
     def _on_cell_changed(self, item: QTableWidgetItem):
         if item.column() == 1:
             self._dirty = True
+
+    def _on_selection_changed(self):
+        count = len(self._table.selectionModel().selectedRows())
+        self._sel_label.setText(
+            f"{count} 行選択中" if count else "（行を選択してください）"
+        )
+
+    def _update_paste_count(self):
+        raw = self._paste_edit.toPlainText().splitlines()
+        non_empty = sum(1 for l in raw if l.strip())
+        self._paste_count_lbl.setText(
+            f"貼り付け行数: {len(raw)} 行（非空白: {non_empty} 行）"
+        )
+
+    # ── 一括貼り付け ──
+
+    def _apply_paste(self):
+        raw = self._paste_edit.toPlainText().splitlines()
+        if not raw:
+            return
+        skip_empty = self._skip_empty_paste_check.isChecked()
+        paste_lines = [l for l in raw if l.strip()] if skip_empty else raw
+        if not paste_lines:
+            return
+
+        mode = self._mode_combo.currentIndex()
+        overwrite = self._overwrite_check.isChecked()
+        n_rows = self._table.rowCount()
+        self._table.blockSignals(True)
+
+        if mode == 2:
+            # 空行のみ埋める
+            pi = 0
+            for row in range(n_rows):
+                if pi >= len(paste_lines):
+                    break
+                cur = self._get_zh(row)
+                if not cur.strip():
+                    self._set_zh(row, paste_lines[pi])
+                    pi += 1
+        else:
+            if mode == 0:
+                start = 0
+            else:
+                sel = self._table.selectionModel().selectedRows()
+                start = min(r.row() for r in sel) if sel else 0
+            for pi, text in enumerate(paste_lines):
+                row = start + pi
+                if row >= n_rows:
+                    break
+                if overwrite or not self._get_zh(row).strip():
+                    self._set_zh(row, text)
+
+        self._table.blockSignals(False)
+        self._dirty = True
+
+    # ── ZH テキストの取得・設定ヘルパー ──
+
+    def _get_zh(self, row: int) -> str:
+        item = self._table.item(row, 1)
+        return item.text() if item else ''
+
+    def _set_zh(self, row: int, text: str):
+        item = self._table.item(row, 1)
+        if item is not None:
+            item.setText(text)
+        else:
+            new_item = QTableWidgetItem(text)
+            new_item.setFont(self._zh_font)
+            self._table.setItem(row, 1, new_item)
+
+    # ── ZH シフト操作 ──
+    # 選択行 + その直上/直下の行を「循環入れ替え」することで、
+    # 選択ブロックの ZH テキストを 1 行上/下に移動する。
+
+    def _shift_zh_up(self):
+        sel = sorted(r.row() for r in self._table.selectionModel().selectedRows())
+        if not sel or sel[0] == 0:
+            return
+        self._table.blockSignals(True)
+        block = [sel[0] - 1] + sel
+        texts = [self._get_zh(r) for r in block]
+        rotated = texts[1:] + [texts[0]]        # 左回転: 選択ZHが1行上へ
+        for r, t in zip(block, rotated):
+            self._set_zh(r, t)
+        self._table.blockSignals(False)
+        self._dirty = True
+
+    def _shift_zh_down(self):
+        sel = sorted(r.row() for r in self._table.selectionModel().selectedRows())
+        n = self._table.rowCount()
+        if not sel or sel[-1] >= n - 1:
+            return
+        self._table.blockSignals(True)
+        block = sel + [sel[-1] + 1]
+        texts = [self._get_zh(r) for r in block]
+        rotated = [texts[-1]] + texts[:-1]      # 右回転: 選択ZHが1行下へ
+        for r, t in zip(block, rotated):
+            self._set_zh(r, t)
+        self._table.blockSignals(False)
+        self._dirty = True
+
+    def _clear_selected_zh(self):
+        sel = self._table.selectionModel().selectedRows()
+        if not sel:
+            return
+        self._table.blockSignals(True)
+        for idx in sel:
+            self._set_zh(idx.row(), '')
+        self._table.blockSignals(False)
+        self._dirty = True
+
+    # ── 確定 / キャンセル ──
 
     def _accept(self):
         self._result = [

@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QListWidget, QListWidgetItem, QLabel, QPushButton,
     QSlider, QFileDialog, QMenu, QSizePolicy, QFrame, QScrollArea,
     QAbstractItemView, QToolButton, QDialog, QDialogButtonBox,
-    QFormLayout, QLineEdit, QSystemTrayIcon,
+    QFormLayout, QLineEdit, QSystemTrayIcon, QComboBox,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QUrl, QSize, pyqtSignal, QObject, QPoint, QPointF,
@@ -269,6 +269,99 @@ def _lock_icon(locked: bool) -> QIcon:
         p.drawArc(11, 4, 8, 10, 35 * 16, 180 * 16)
     p.end()
     return QIcon(px)
+
+
+def _file_dialog_size(width: int = 700, height: int = 440) -> QSize:
+    screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+    if not screen:
+        return QSize(width, height)
+    avail = screen.availableGeometry()
+    return QSize(
+        min(width, max(560, int(avail.width() * 0.56))),
+        min(height, max(360, int(avail.height() * 0.50))),
+    )
+
+
+def _fit_standard_file_dialog(dlg: QFileDialog, width: int = 700, height: int = 440) -> None:
+    target = _file_dialog_size(width, height)
+    dlg.setMinimumSize(520, 340)
+    dlg.resize(target)
+    screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+    if screen:
+        frame = dlg.frameGeometry()
+        frame.moveCenter(screen.availableGeometry().center())
+        dlg.move(frame.topLeft())
+
+
+def _make_address_combo_editable(dlg: QFileDialog) -> None:
+    combo = dlg.findChild(QComboBox, "lookInCombo")
+    if combo is None:
+        return
+    combo.setEditable(True)
+    edit = combo.lineEdit()
+    if edit is None:
+        return
+    edit.setClearButtonEnabled(True)
+
+    def navigate_from_combo():
+        text = edit.text().strip().strip('"')
+        if not text:
+            return
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = Path(dlg.directory().absolutePath()) / path
+        if path.is_dir():
+            dlg.setDirectory(str(path))
+        elif path.parent.is_dir():
+            dlg.setDirectory(str(path.parent))
+            dlg.selectFile(path.name)
+
+    edit.returnPressed.connect(navigate_from_combo)
+
+
+def _prepare_standard_file_dialog(dlg: QFileDialog, width: int = 700, height: int = 440) -> None:
+    dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+    dlg.setViewMode(QFileDialog.ViewMode.Detail)
+    dlg.setSizeGripEnabled(True)
+    _fit_standard_file_dialog(dlg, width, height)
+    _make_address_combo_editable(dlg)
+
+
+class StandardFileDialog:
+    """Small adapter around Qt's built-in QFileDialog."""
+
+    @staticmethod
+    def open_file(parent, title: str, directory: str,
+                  filters: str) -> Tuple[str, str]:
+        dlg = QFileDialog(parent, title, directory, filters)
+        dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
+        _prepare_standard_file_dialog(dlg)
+        if dlg.exec():
+            files = dlg.selectedFiles()
+            return (files[0] if files else ""), dlg.selectedNameFilter()
+        return "", ""
+
+    @staticmethod
+    def open_files(parent, title: str, directory: str,
+                   filters: str) -> Tuple[List[str], str]:
+        dlg = QFileDialog(parent, title, directory, filters)
+        dlg.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        _prepare_standard_file_dialog(dlg)
+        if dlg.exec():
+            return dlg.selectedFiles(), dlg.selectedNameFilter()
+        return [], ""
+
+    @staticmethod
+    def save_file(parent, title: str, directory: str,
+                  filters: str) -> Tuple[str, str]:
+        dlg = QFileDialog(parent, title, directory, filters)
+        dlg.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dlg.setFileMode(QFileDialog.FileMode.AnyFile)
+        _prepare_standard_file_dialog(dlg)
+        if dlg.exec():
+            files = dlg.selectedFiles()
+            return (files[0] if files else ""), dlg.selectedNameFilter()
+        return "", ""
 
 
 def _player_icon(kind: str, color: str = _TEXT) -> QIcon:
@@ -680,7 +773,7 @@ class PlaylistPanel(QWidget):
         lay.addLayout(btn_row)
 
     def _add_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(
+        paths, _ = StandardFileDialog.open_files(
             self, "音声ファイルを追加",
             str(_DIR_SONGS),
             "Audio Files (*.mp3 *.flac *.aac *.m4a *.wav *.ogg *.opus *.wma *.ape *.aiff)"
@@ -1233,7 +1326,7 @@ class LyricOverlay(QWidget):
         self.visibility_changed.emit(False)
 
     def _open_lyrics(self):
-        p, _ = QFileDialog.getOpenFileName(self, "歌詞ファイルを選択", str(_DIR_FLRC), "FLRC歌詞 (*.flrc)")
+        p, _ = StandardFileDialog.open_file(self, "歌詞ファイルを選択", str(_DIR_FLRC), "FLRC歌詞 (*.flrc)")
         if p:
             self._load_lyrics(p)
 
@@ -1787,7 +1880,7 @@ class PlayerWindow(QMainWindow):
     def _assign_lyrics_to_track(self, row: int):
         if not (0 <= row < len(self._tracks)):
             return
-        p, _ = QFileDialog.getOpenFileName(
+        p, _ = StandardFileDialog.open_file(
             self, f"歌詞を指定 — {self._tracks[row].display_title()}", str(_DIR_FLRC), "FLRC歌詞 (*.flrc)"
         )
         if p:
@@ -1809,7 +1902,7 @@ class PlayerWindow(QMainWindow):
         self._playlist.rebuild(self._tracks, self._current)
 
     def _add_files_dialog(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "音声ファイルを追加", str(_DIR_SONGS), _AUDIO_FILTER)
+        paths, _ = StandardFileDialog.open_files(self, "音声ファイルを追加", str(_DIR_SONGS), _AUDIO_FILTER)
         if paths:
             self._add_tracks(paths)
 
@@ -1843,7 +1936,7 @@ class PlayerWindow(QMainWindow):
 
     def _save_playlist_as(self):
         """Ctrl+Shift+S: always prompt for a new path."""
-        path, _ = QFileDialog.getSaveFileName(
+        path, _ = StandardFileDialog.save_file(
             self, "名前を付けて保存", str(_DIR_FLPLS), f"furi-lrc Playlist (*{_PLAYLIST_EXT})"
         )
         if path:
@@ -1853,7 +1946,7 @@ class PlayerWindow(QMainWindow):
             self._save_playlist(path)
 
     def _load_playlist_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(
+        path, _ = StandardFileDialog.open_file(
             self, "プレイリストを開く", str(_DIR_FLPLS), f"furi-lrc Playlist (*{_PLAYLIST_EXT})"
         )
         if path:
@@ -1949,7 +2042,7 @@ class PlayerWindow(QMainWindow):
     def _open_lyrics_for_current(self):
         if not self._overlay:
             return
-        p, _ = QFileDialog.getOpenFileName(self, "歌詞ファイルを選択", str(_DIR_FLRC), "FLRC歌詞 (*.flrc)")
+        p, _ = StandardFileDialog.open_file(self, "歌詞ファイルを選択", str(_DIR_FLRC), "FLRC歌詞 (*.flrc)")
         if p:
             self._overlay._load_lyrics(p)
 
