@@ -619,6 +619,7 @@ class PlaylistPanel(QWidget):
     save_req      = pyqtSignal()
     load_req      = pyqtSignal()
     assign_lyrics = pyqtSignal(int)    # row index
+    reordered     = pyqtSignal(list)   # list[int] — new track-index order after DnD
 
     def __init__(self):
         super().__init__()
@@ -658,6 +659,7 @@ class PlaylistPanel(QWidget):
         )
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._ctx_menu)
+        self._list.model().rowsMoved.connect(self._on_rows_moved)
         lay.addWidget(self._list)
 
         # Buttons
@@ -712,6 +714,7 @@ class PlaylistPanel(QWidget):
             lyrics_name = Path(t.lyrics_path).stem if t.lyrics_path else ""
             item = QListWidgetItem()
             item.setSizeHint(QSize(0, 28))
+            item.setData(Qt.ItemDataRole.UserRole, i)
             self._list.addItem(item)
             self._list.setItemWidget(
                 item,
@@ -735,11 +738,12 @@ class PlaylistPanel(QWidget):
     def selected_rows(self) -> List[int]:
         return [self._list.row(item) for item in self._list.selectedItems()]
 
-    def reordered_indices(self) -> List[int]:
-        """Return current item data order (after internal drag-drop reorder)."""
-        # QListWidget internal DnD already reordered items; we read their text
-        # to rebuild the correct track list in PlayerWindow.
-        return list(range(self._list.count()))
+    def _on_rows_moved(self, *_):
+        new_order = [
+            self._list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self._list.count())
+        ]
+        self.reordered.emit(new_order)
 
 
 # ── Control bar ───────────────────────────────────────────────────────────────
@@ -1380,6 +1384,7 @@ class PlayerWindow(QMainWindow):
         self._playlist.save_req.connect(self._save_playlist_now)
         self._playlist.load_req.connect(self._load_playlist_dialog)
         self._playlist.assign_lyrics.connect(self._assign_lyrics_to_track)
+        self._playlist.reordered.connect(self._on_playlist_reordered)
         splitter.addWidget(self._playlist)
 
         splitter.setSizes([220, 580])
@@ -1791,6 +1796,12 @@ class PlayerWindow(QMainWindow):
             # if currently playing this track, reload lyrics immediately
             if row == self._current and self._overlay:
                 self._overlay._load_lyrics(p)
+
+    def _on_playlist_reordered(self, new_order: List[int]):
+        old_current = self._current
+        self._tracks = [self._tracks[i] for i in new_order]
+        self._current = new_order.index(old_current) if old_current in new_order else -1
+        self._playlist.rebuild(self._tracks, self._current)
 
     def _add_tracks(self, paths: List[str]):
         new = [_build_track(p) for p in paths]
