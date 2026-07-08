@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="FURI-LRC 是面向日语歌曲的假名注音歌词制作、播放与桌面悬浮显示工具。">
+  <meta name="theme-color" content="#11131a">
+  <title>FURI-LRC | 日语注音歌词编辑器与播放器</title>
+  <link rel="icon" href="./assets/furi-lrc-icon.png">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="FURI-LRC 首页">
+      <img src="./assets/furi-lrc-icon.png" width="32" height="32" alt="">
+      <span>FURI-LRC</span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a href="#player">Player</a>
+      <a href="#gui">GUI</a>
+      <a href="#workflow">流程</a>
+      <a href="#formats">格式</a>
+      <a class="nav-cta" href="https://github.com/BeyondWillJ/FURI-LRC/">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-bg" aria-hidden="true">
+        <div class="desktop-line">
+          <span class="jp"><ruby>君<rt>きみ</rt></ruby>の知らない物語</span>
+          <span class="zh">你所不知道的故事</span>
+        </div>
+        <div class="player-glass">
+          <div class="cover"></div>
+          <div class="track-lines">
+            <i></i><i></i><i></i>
+          </div>
+          <div class="controls"><b></b><b></b><b></b><b></b></div>
+        </div>
+      </div>
+      <div class="hero-content">
+        <p class="eyebrow">Windows 11 · PyQt6 · Furigana Lyrics</p>
+        <h1 id="hero-title">FURI-LRC</h1>
+        <p class="lead">为日语歌曲制作带假名注音、逐假名时间轴和中文翻译的歌词，并用内置播放器同步显示在透明桌面悬浮窗中。</p>
+        <div class="hero-actions">
+          <a class="button primary" href="https://github.com/BeyondWillJ/FURI-LRC/">查看源码</a>
+          <a class="button secondary" href="#screenshots">图集</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="section intro" aria-label="项目概览">
+      <div class="section-head">
+        <p class="kicker">一个项目，两类工具</p>
+        <h2>从歌词制作到播放显示，保持同一种数据格式</h2>
+      </div>
+      <div class="feature-grid">
+        <article class="feature">
+          <span class="icon glyph-ja" lang="ja">編</span>
+          <h3>FURI-LRC GUI</h3>
+          <p>制作 <code>.flproj</code> 工程和 <code>.flrc</code> 歌词，支持导入标准 LRC、编辑日文原文、假名注音、中文翻译与逐单位时间。</p>
+        </article>
+        <article class="feature">
+          <span class="icon">▶</span>
+          <h3>FURI-LRC Player</h3>
+          <p>管理播放列表、读取音频标签与封面，播放时自动匹配歌词，并把进度直接传给桌面歌词窗。</p>
+        </article>
+        <article class="feature">
+          <span class="icon glyph-ja" lang="ja">詞</span>
+          <h3>透明歌词窗</h3>
+          <p>置顶、可拖拽、可锁定、可穿透点击。歌词使用本地字体绘制，支持假名、日文、中文三层排版和扫色高亮。</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="player" class="section split">
+      <div class="copy">
+        <p class="kicker">Player</p>
+        <h2>专为 FURI-LRC 歌词设计的播放器</h2>
+        <p>播放器以 Qt Multimedia 驱动本地音频，避免依赖系统媒体会话即可获得稳定的毫秒级进度。播放时会打开并同步桌面歌词窗，适合日语听歌、跟唱和歌词校对。</p>
+        <ul class="checks">
+          <li>支持播放列表 <code>.flpl</code>，可拖入音频或播放列表文件。</li>
+          <li>自动按歌曲文件名、标题或同目录搜索 <code>.flrc</code> 歌词。</li>
+          <li>支持循环、单曲、顺序、随机播放和歌词偏移校准。</li>
+          <li>系统托盘控制播放、切歌、循环模式和桌面歌词开关。</li>
+        </ul>
+      </div>
+      <figure class="screenshot-slot">
+        <img src="./assets/screenshots/player-main.png" alt="FURI-LRC Player 主界面截图" onload="this.closest('figure').classList.add('has-image')" onerror="this.hidden=true">
+      </figure>
+    </section>
+
+    <section id="gui" class="section split reverse">
+      <div class="copy">
+        <p class="kicker">GUI</p>
+        <h2>面向逐假名歌词的编辑工作台</h2>
+        <p>编辑器把音频波形、歌词行列表、单行日文/中文编辑和时间单位表放在同一个窗口中。你可以先导入普通 LRC，再逐步补全假名、翻译和更细粒度的时间。</p>
+        <ul class="checks">
+          <li>波形显示与歌词行拖拽对齐，支持打拍模式快速标记每行开始时间。</li>
+          <li>使用 <code>{漢字|かな}</code> 标记写入假名注音，并继续编辑每个单位的起止时间。</li>
+          <li>导出普通 <code>.lrc</code> 或 FURI-LRC 专用 <code>.flrc</code>，工程状态保存为 <code>.flproj</code>。</li>
+          <li>内置批量翻译编辑、查找替换、撤销重做和界面缩放。</li>
+        </ul>
+      </div>
+      <figure class="screenshot-slot">
+        <img src="./assets/screenshots/gui-editor.png" alt="FURI-LRC GUI 编辑器截图" onload="this.closest('figure').classList.add('has-image')" onerror="this.hidden=true">
+      </figure>
+    </section>
+
+    <section id="workflow" class="section workflow">
+      <div class="section-head">
+        <p class="kicker">Workflow</p>
+        <h2>推荐制作流程</h2>
+      </div>
+      <div class="steps">
+        <article>
+          <span>01</span>
+          <h3>导入音频与 LRC</h3>
+          <p>打开歌曲文件，导入已有 LRC 作为行级时间轴，先得到可编辑的歌词骨架。</p>
+        </article>
+        <article>
+          <span>02</span>
+          <h3>补全注音与翻译</h3>
+          <p>在日文文本中加入 <code>{base|reading}</code>，维护中文翻译，保存为 <code>.flproj</code> 继续迭代。</p>
+        </article>
+        <article>
+          <span>03</span>
+          <h3>校准逐单位时间</h3>
+          <p>结合波形、快捷键和单位打拍，把假名单位的起止时间调整到演唱节奏。</p>
+        </article>
+        <article>
+          <span>04</span>
+          <h3>导出并播放</h3>
+          <p>导出 <code>.flrc</code>，用 Player 播放歌曲，透明悬浮窗会同步显示逐假名高亮。</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="screenshots" class="section gallery">
+      <div class="section-head">
+        <p class="kicker">Screenshots</p>
+        <h2>图集</h2>
+        <p>FURI-LRC GUI 编辑器、播放器和桌面悬浮歌词窗的截图。</p>
+      </div>
+      <div class="gallery-grid">
+        <figure class="screenshot-slot wide">
+          <img src="./assets/screenshots/overlay-desktop.png" alt="桌面悬浮歌词截图" onload="this.closest('figure').classList.add('has-image')" onerror="this.hidden=true">
+        </figure>
+        <figure class="screenshot-slot">
+          <img src="./assets/screenshots/gui-units.png" alt="逐假名时间编辑截图" onload="this.closest('figure').classList.add('has-image')" onerror="this.hidden=true">
+        </figure>
+        <figure class="screenshot-slot">
+          <img src="./assets/screenshots/player-playlist.png" alt="播放器播放列表截图" onload="this.closest('figure').classList.add('has-image')" onerror="this.hidden=true">
+        </figure>
+      </div>
+    </section>
+
+    <section id="formats" class="section formats">
+      <div class="copy">
+        <p class="kicker">Formats</p>
+        <h2>清晰的文件边界</h2>
+        <p>FURI-LRC 把“可继续编辑的工程”和“可播放显示的歌词”分开保存，既方便校对，也方便把最终歌词和播放器一起分发。</p>
+      </div>
+      <div class="format-list" aria-label="文件格式说明">
+        <div><code>.flproj</code><span>编辑器工程：音频路径、歌词、窗口状态、波形缩放等。</span></div>
+        <div><code>.flrc</code><span>播放器歌词：日文片段、假名单位、时间轴和中文翻译。</span></div>
+        <div><code>.flpl</code><span>播放器列表：歌曲路径、绑定歌词、偏移量和循环模式。</span></div>
+        <div><code>.lrc</code><span>通用歌词：可导入作为起点，也可从编辑器导出。</span></div>
+      </div>
+    </section>
+
+    <section class="section quickstart">
+      <div>
+        <p class="kicker">Quick Start</p>
+        <h2>本地运行</h2>
+      </div>
+      <div class="terminal" aria-label="运行命令">
+        <pre><code>pip install -r requirements.txt
+python furi-lrc-gui.py
+python furi-lrc-player.py</code></pre>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>FURI-LRC</span>
+    <a href="https://github.com/BeyondWillJ/FURI-LRC/">BeyondWillJ/FURI-LRC</a>
+  </footer>
+</body>
+</html>
