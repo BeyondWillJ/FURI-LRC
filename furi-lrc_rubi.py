@@ -267,6 +267,13 @@ class _MoraDraw:
     s_ms:  float
     e_ms:  float
     is_rt: bool    # True = furigana mora (drawn above jp baseline)
+    # Sweep-reveal geometry — usually equal to (x, w), but for ruby morae
+    # this is rescaled to span the segment's full on-screen width (the wider
+    # of base/furigana), so the karaoke wipe reaches the right edge of
+    # whichever of the two (base or furigana) is wider, with no dead gap
+    # before the next segment starts. See _get_sweep_x().
+    reveal_x: float = 0.0
+    reveal_w: float = 0.0
 
 
 @dataclasses.dataclass
@@ -748,13 +755,41 @@ class LyricsCanvas(QWidget):
                     morae.append(m)
                     seg_morae.append(m)
                     cx += mw
+                # Distribute the segment's *full* on-screen width (Wc — whichever
+                # of base/furigana is wider) across its morae, proportionally to
+                # each mora's rendered furigana width, so the cumulative reveal
+                # exactly spans [x, x + Wc] with no gap at either end.
+                #
+                # This must use Wc (not just Wb) because the base block is
+                # centred inside Wc: when the base is wider than the furigana
+                # (Wb > Wr) it sits flush against both edges (Wc == Wb, so this
+                # reduces to the base's own width as before); when the furigana
+                # is wider (Wr > Wb, the common case — e.g. two kanji read by
+                # three-plus kana) the base is padded on *both* sides and Wc ==
+                # Wr, so the reveal must reach all the way to x + Wr or the
+                # widest (furigana) glyphs would sit unrevealed after the base
+                # finishes, then jump instantly forward once the next segment's
+                # morae start progressing.
+                running = 0.0
+                n_units = len(seg_morae)
+                for idx, sm in enumerate(seg_morae):
+                    if idx == n_units - 1:
+                        rw = Wc - running
+                    elif Wr > 0:
+                        rw = (sm.w / Wr) * Wc
+                    else:
+                        rw = Wc / n_units
+                    sm.reveal_x = x + running
+                    sm.reveal_w = max(0.0, rw)
+                    running += sm.reveal_w
                 kanjis.append(_KanjiDraw(x=kanji_x, w=Wb, text=base, mora_refs=seg_morae))
                 x += Wc
             else:
                 for u in units:
                     uw = fm_jp.horizontalAdvance(u["k"])
                     m  = _MoraDraw(x=x, w=uw, text=u["k"],
-                                   s_ms=float(u["s"]), e_ms=float(u["e"]), is_rt=False)
+                                   s_ms=float(u["s"]), e_ms=float(u["e"]), is_rt=False,
+                                   reveal_x=x, reveal_w=uw)
                     morae.append(m)
                     x += uw
 
@@ -942,7 +977,7 @@ class LyricsCanvas(QWidget):
         for m in layout.morae:
             p = _mora_progress(m, ms)
             if p > 0.0:
-                right = m.x + m.w * p
+                right = m.reveal_x + m.reveal_w * p
                 if right > sweep_layout:
                     sweep_layout = right
 

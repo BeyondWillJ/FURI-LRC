@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QUrl, QSize, pyqtSignal, QObject, QPoint, QPointF,
-    QPropertyAnimation, QEasingCurve, QRectF, QMimeData, QModelIndex,
+    QPropertyAnimation, QEasingCurve, QRectF, QMimeData, QModelIndex, QEvent,
 )
 from PyQt6.QtGui import (
     QColor, QCursor, QPainter, QPen, QFont, QFontDatabase,
@@ -224,15 +224,21 @@ class Track:
 
 
 def _read_tags(path: str) -> Tuple[str, str, str, bytes]:
-    """Return (title, artist, album, cover_bytes). Falls back to filename."""
-    title = artist = album = ""
-    art   = b""
-    stem  = Path(path).stem
+    """Return (title, artist, album, cover_bytes).
+
+    Title always follows the current filename (not an embedded ID3 tag), so
+    that locally renaming an audio file is reflected immediately when it is
+    (re-)added — an embedded title tag is static and would otherwise keep
+    showing the name the file had when it was tagged, even after a rename.
+    Artist/album/cover art still come from embedded tags when present.
+    """
+    artist = album = ""
+    art    = b""
+    stem   = Path(path).stem
     if HAS_MUTAGEN:
         try:
             f = mutagen.File(path, easy=True)
             if f:
-                title  = str(f.get("title",  [stem])[0])
                 artist = str(f.get("artist", [""])[0])
                 album  = str(f.get("album",  [""])[0])
             # album art (ID3)
@@ -244,7 +250,7 @@ def _read_tags(path: str) -> Tuple[str, str, str, bytes]:
                         break
         except Exception:
             pass
-    return title or stem, artist, album, art
+    return stem, artist, album, art
 
 
 def _build_track(path: str) -> Track:
@@ -480,8 +486,11 @@ class SeekBar(QWidget):
             self.update()
 
     def _x_to_ms(self, x: int) -> int:
+        # Inverse of _ms_to_x: the groove is inset by 8px on each side, so the
+        # same offset must be subtracted here or the resulting ms (and thus
+        # the handle's new position) ends up shifted from the click point.
         w = max(1, self.width() - 16)
-        return max(0, min(self._dur, int(x / w * self._dur)))
+        return max(0, min(self._dur, int((x - 8) / w * self._dur)))
 
     def _ms_to_x(self, ms: int) -> float:
         return ms / self._dur * (self.width() - 16) + 8 if self._dur else 8.0
@@ -1439,6 +1448,10 @@ class PlayerWindow(QMainWindow):
         self._build_shortcuts()
         self.setStyleSheet(_STYLESHEET)
 
+        # Global filter: guarantee Space always toggles play/pause regardless
+        # of which widget currently has keyboard focus (see eventFilter()).
+        QApplication.instance().installEventFilter(self)
+
         # ── Geometry save timer ──
         self._geo_timer = QTimer(self)
         self._geo_timer.setSingleShot(True)
@@ -1614,7 +1627,14 @@ class PlayerWindow(QMainWindow):
         QApplication.quit()
 
     def _build_shortcuts(self):
-        QShortcut(QKeySequence(Qt.Key.Key_Space),      self).activated.connect(self._toggle_play)
+        # Space is intentionally *not* registered as a QShortcut here: widgets
+        # such as QListWidget/QPushButton claim the Space key for their own
+        # purposes (item selection, button click) by accepting the
+        # ShortcutOverride event before a window-level QShortcut ever gets a
+        # chance to fire, so playback would only toggle when focus happened to
+        # be elsewhere. Space is instead handled unconditionally by a global
+        # application event filter (see eventFilter()) so it always toggles
+        # play/pause regardless of which widget currently has focus.
         QShortcut(QKeySequence(Qt.Key.Key_Left),       self).activated.connect(lambda: self._seek_rel(-5000))
         QShortcut(QKeySequence(Qt.Key.Key_Right),      self).activated.connect(lambda: self._seek_rel(5000))
         QShortcut(QKeySequence("Ctrl+Left"),            self).activated.connect(self.prev_track)
@@ -1626,6 +1646,21 @@ class PlayerWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Delete),      self).activated.connect(self._remove_selected)
         QShortcut(QKeySequence(Qt.Key.Key_Up),          self).activated.connect(lambda: self._adjust_volume(0.05))
         QShortcut(QKeySequence(Qt.Key.Key_Down),        self).activated.connect(lambda: self._adjust_volume(-0.05))
+
+    def eventFilter(self, obj, event):
+        # Application-wide filter so Space always toggles play/pause, even
+        # when focus sits on a widget (QListWidget, QPushButton, ...) that
+        # would otherwise consume the key itself. Text-entry widgets are
+        # exempted so a literal space can still be typed into them.
+        if event.type() == QEvent.Type.KeyPress:
+            key_event = event
+            if (key_event.key() == Qt.Key.Key_Space
+                    and key_event.modifiers() == Qt.KeyboardModifier.NoModifier):
+                focus_widget = QApplication.focusWidget()
+                if not isinstance(focus_widget, (QLineEdit,)):
+                    self._toggle_play()
+                    return True
+        return super().eventFilter(obj, event)
 
     # ── Playback control ──────────────────────────────────────────────────────
 
