@@ -35,7 +35,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 try:
-    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
     HAS_MEDIA = True
 except ImportError:
     HAS_MEDIA = False
@@ -1419,11 +1419,14 @@ class PlayerWindow(QMainWindow):
         # ── Media player ──
         self._player: Optional[QMediaPlayer] = None
         self._audio:  Optional[QAudioOutput] = None
+        self._media_devices: Optional[QMediaDevices] = None
         if HAS_MEDIA:
             self._audio  = QAudioOutput()
             self._player = QMediaPlayer()
             self._player.setAudioOutput(self._audio)
             self._audio.setVolume(self._volume)
+            self._media_devices = QMediaDevices(self)
+            self._media_devices.audioOutputsChanged.connect(self._on_audio_outputs_changed)
             self._player.positionChanged.connect(self._on_position)
             self._player.durationChanged.connect(self._on_duration)
             self._player.playbackStateChanged.connect(self._on_state_change)
@@ -1769,6 +1772,19 @@ class PlayerWindow(QMainWindow):
         self._ctrl.set_loop_mode(self._loop)
         if hasattr(self, "_tray_loop_acts"):
             self._tray_loop_acts[mode].setChecked(True)
+
+    def _on_audio_outputs_changed(self):
+        # Windows can replace the default endpoint after a headset is plugged
+        # in. Rebind after the device notification finishes so playback does
+        # not remain attached to the disconnected endpoint.
+        QTimer.singleShot(0, self._use_default_audio_output)
+
+    def _use_default_audio_output(self):
+        if not self._audio:
+            return
+        device = QMediaDevices.defaultAudioOutput()
+        if not device.isNull():
+            self._audio.setDevice(device)
 
     # ── QMediaPlayer callbacks ────────────────────────────────────────────────
 
