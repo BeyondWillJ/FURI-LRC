@@ -67,10 +67,11 @@ def _bundle_root() -> Path:
 
 
 _BASE     = _app_root()
+_DIR_PRIVATE = _BASE / "private"
 _DIR_DATA  = _BASE / "data-player"
-_DIR_SONGS = _BASE / "songs"
-_DIR_FLRC  = _BASE / "flrc"
-_DIR_FLPLS = _BASE / "flpls"
+_DIR_SONGS = _DIR_PRIVATE / "songs"
+_DIR_FLRC  = _DIR_PRIVATE / "flrc"
+_DIR_FLPLS = _DIR_PRIVATE / "flpls"
 
 
 # Use a per-user local socket so starting the executable again activates the

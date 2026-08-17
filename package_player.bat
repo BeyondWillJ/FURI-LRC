@@ -91,8 +91,8 @@ if not exist "dist\furi-lrc-player\_internal\fonts\NotoSerifJP-SemiBold.ttf" (
 )
 
 echo Copying sample files...
-%PYTHON% -c "import shutil,pathlib; p=pathlib.Path('songs/跚をあけて.mp3'); shutil.copy2(p, pathlib.Path('dist/furi-lrc-player/songs')/p.name) if p.exists() else None"
-if exist "flrc\tobira-wo-akete.flrc"    copy /y "flrc\tobira-wo-akete.flrc"    "dist\furi-lrc-player\flrc\" >nul
+%PYTHON% -c "import shutil,pathlib; p=pathlib.Path('private/songs/跚をあけて.mp3'); shutil.copy2(p, pathlib.Path('dist/furi-lrc-player/songs')/p.name) if p.exists() else None"
+if exist "private\flrc\tobira-wo-akete.flrc"    copy /y "private\flrc\tobira-wo-akete.flrc"    "dist\furi-lrc-player\flrc\" >nul
 
 echo.
 echo ============================================================

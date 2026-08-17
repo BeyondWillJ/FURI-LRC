@@ -2,6 +2,13 @@
 /__pycache__
 /.venv
 /.agents
+/private/
+/songs/*
+!/songs/.gitkeep
+/flrc/*
+!/flrc/.gitkeep
+/flpls/*
+!/flpls/.gitkeep
 *.mp4
 /build
 /dist

@@ -90,8 +90,9 @@ def str_to_ms(text: str) -> Optional[int]:
 _RUBY_RE = re.compile(r'\{([^|{}]+)\|([^{}]+)\}')
 
 _BASE_DIR  = Path(__file__).parent
-_DIR_SONGS = _BASE_DIR / "songs"
-_DIR_FLRC  = _BASE_DIR / "flrc"
+_DIR_PRIVATE = _BASE_DIR / "private"
+_DIR_SONGS = _DIR_PRIVATE / "songs"
+_DIR_FLRC  = _DIR_PRIVATE / "flrc"
 
 # Populated in main() after QFontDatabase.addApplicationFont
 _NOTO_JP = ""  # NotoSansJP family name
