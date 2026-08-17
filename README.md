@@ -8,7 +8,7 @@
     <a href="https://github.com/BeyondWillJ/FURI-LRC/releases/latest"><img src="https://img.shields.io/github/v/release/BeyondWillJ/FURI-LRC?style=flat-square&display_name=tag&sort=semver" alt="Latest release"></a>
     <a href="https://github.com/BeyondWillJ/FURI-LRC/releases"><img src="https://img.shields.io/github/downloads/BeyondWillJ/FURI-LRC/total?style=flat-square" alt="Release downloads"></a>
     <a href="https://github.com/BeyondWillJ/FURI-LRC/stargazers"><img src="https://img.shields.io/github/stars/BeyondWillJ/FURI-LRC?style=flat-square" alt="GitHub stars"></a>
-    <a href="https://github.com/BeyondWillJ/FURI-LRC/forks"><img src="https://img.shields.io/github/forks/BeyondWillJ/FURI-LRC?style=flat-square" alt="GitHub forks"></a>
+    <a href="https://github.com/BeyondWillJ/FURI-LRC/forks"><img src="https://img.shields.io/github/forks/BeyondWillJ/FURI-LRC?style=flat-square" alt="GitHub forks"></a><br>
     <a href="https://github.com/BeyondWillJ/FURI-LRC/issues"><img src="https://img.shields.io/github/issues/BeyondWillJ/FURI-LRC?style=flat-square" alt="GitHub issues"></a>
     <a href="https://github.com/BeyondWillJ/FURI-LRC/commits/main"><img src="https://img.shields.io/github/last-commit/BeyondWillJ/FURI-LRC?style=flat-square" alt="Last commit"></a>
     <a href="https://furi-lrc.beyondwj.cc/"><img src="https://img.shields.io/badge/website-FURI--LRC-8B5CF6?style=flat-square&logo=cloudflare&logoColor=white" alt="FURI-LRC website"></a>
