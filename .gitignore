@@ -9,6 +9,7 @@
 !/flrc/.gitkeep
 /flpls/*
 !/flpls/.gitkeep
+/TOOLS/metatag-writer/*.jpg
 *.mp4
 /build
 /dist
