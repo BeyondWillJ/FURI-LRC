@@ -1,6 +1,29 @@
-# FURI-LRC
+<div align="center">
+  <img src="https://furi-lrc.beyondwj.cc/assets/furi-lrc-icon.png" width="112" alt="FURI-LRC 图标">
+  <h1>FURI-LRC</h1>
+  <p><strong>为日语歌曲而生的逐字歌词编辑器、播放器与桌面悬浮歌词</strong></p>
+  <p>逐字时间轴 · 假名注音 · 中文翻译 · 音频波形 · 透明悬浮窗</p>
 
-FURI-LRC 是一个面向日语歌曲的带假名注音歌词制作与播放工具。仓库包含三个主要程序：
+  <p>
+    <a href="https://github.com/BeyondWillJ/FURI-LRC/releases/latest"><img src="https://img.shields.io/github/v/release/BeyondWillJ/FURI-LRC?style=flat-square&display_name=tag&sort=semver" alt="Latest release"></a>
+    <a href="https://github.com/BeyondWillJ/FURI-LRC/releases"><img src="https://img.shields.io/github/downloads/BeyondWillJ/FURI-LRC/total?style=flat-square" alt="Release downloads"></a>
+    <a href="https://github.com/BeyondWillJ/FURI-LRC/stargazers"><img src="https://img.shields.io/github/stars/BeyondWillJ/FURI-LRC?style=flat-square" alt="GitHub stars"></a>
+    <a href="https://github.com/BeyondWillJ/FURI-LRC/forks"><img src="https://img.shields.io/github/forks/BeyondWillJ/FURI-LRC?style=flat-square" alt="GitHub forks"></a>
+    <a href="https://github.com/BeyondWillJ/FURI-LRC/issues"><img src="https://img.shields.io/github/issues/BeyondWillJ/FURI-LRC?style=flat-square" alt="GitHub issues"></a>
+    <a href="https://github.com/BeyondWillJ/FURI-LRC/commits/main"><img src="https://img.shields.io/github/last-commit/BeyondWillJ/FURI-LRC?style=flat-square" alt="Last commit"></a>
+    <a href="https://furi-lrc.beyondwj.cc/"><img src="https://img.shields.io/badge/website-FURI--LRC-8B5CF6?style=flat-square&logo=cloudflare&logoColor=white" alt="FURI-LRC website"></a>
+  </p>
+
+  <p>
+    <img src="https://img.shields.io/badge/Platform-Windows_11-0078D4?logo=windows11&logoColor=white" alt="Windows 11">
+    <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+">
+    <img src="https://img.shields.io/badge/GUI-PyQt6-41CD52?logo=qt&logoColor=white" alt="PyQt6">
+  </p>
+</div>
+
+<img src="https://furi-lrc.beyondwj.cc/assets/screenshots/player-main.png" width="100%" alt="FURI-LRC Player 主界面">
+
+FURI-LRC 是一个面向日语歌曲的带假名注音歌词制作与播放工具。它把歌词制作、逐字对轴、音乐播放和桌面展示整合在一起，包含三个主要程序：
 
 - `furi-lrc-gui.py`：歌词编辑器，用于制作带逐字时间轴、假名注音和中文翻译的歌词 JSON。
 - `furi-lrc-player.py`：内置音频播放器，支持播放列表、音频播放和歌词悬浮窗同步显示。
@@ -8,7 +31,7 @@ FURI-LRC 是一个面向日语歌曲的带假名注音歌词制作与播放工�
 
 项目主要在 Windows 11 + Python + PyQt6 环境下使用。
 
-## 功能
+## 功能亮点
 
 - 制作 furi-lrc 歌词 JSON
 - 从标准 `.lrc` 导入歌词时间轴
@@ -19,6 +42,31 @@ FURI-LRC 是一个面向日语歌曲的带假名注音歌词制作与播放工�
 - 支持透明置顶歌词悬浮窗
 - 支持播放器播放列表 `.flpl`
 - 支持自动保存最近播放列表和悬浮窗设置
+
+## 界面预览
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="https://furi-lrc.beyondwj.cc/assets/screenshots/gui-editor.png" alt="FURI-LRC GUI 编辑器"><br>
+      <sub><b>歌词编辑器</b> — 波形、歌词行与注音编辑集中在一个工作区</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="https://furi-lrc.beyondwj.cc/assets/screenshots/overlay-desktop.png" alt="桌面悬浮歌词"><br>
+      <sub><b>桌面悬浮歌词</b> — 同步显示日文、假名与中文翻译</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="https://furi-lrc.beyondwj.cc/assets/screenshots/gui-units.png" alt="逐假名时间编辑"><br>
+      <sub><b>精细时间轴</b> — 支持逐字、逐假名调整时间</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="https://furi-lrc.beyondwj.cc/assets/screenshots/player-playlist.png" alt="播放器播放列表"><br>
+      <sub><b>音乐播放器</b> — 播放列表与歌词悬浮窗联动</sub>
+    </td>
+  </tr>
+</table>
 
 ## 环境要求
 
