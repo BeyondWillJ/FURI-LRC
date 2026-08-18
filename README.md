@@ -200,7 +200,7 @@ python furi-lrc_rubi.py
 | `furi-lrc_rubi.py` | 独立歌词悬浮窗 |
 | `requirements.txt` | Python 依赖 |
 | `fonts/` | 内置字体资源 |
-| `settings.json` | 悬浮窗位置、样式等本地设置 |
+| `player_data/settings.json` | Player 悬浮窗位置、样式等本地设置 |
 | `*.flproj` | 编辑器项目文件 |
 | `*.flpl` | 播放器播放列表 |
 | `*.json` | furi-lrc 歌词文件 |
@@ -209,7 +209,7 @@ python furi-lrc_rubi.py
 ## 注意事项
 
 - 项目中的示例音频、播放列表、设置文件可能包含本机绝对路径；换机器后需要重新选择音频或歌词文件。
-- `settings.json` 和 `_last_playlist.flpl` 是运行时状态文件，会随使用变化。
+- `player_data/settings.json` 和 `player_data/_last_playlist.flpl` 是 Player 运行时状态文件，会随使用变化。
 - 独立悬浮窗的系统媒体同步依赖 `winsdk` 和 Windows 当前媒体会话；如果同步不稳定，可以优先使用 `furi-lrc-player.py` 内置播放器。
 - 如果界面文字显示异常，请确认终端和编辑器使用 UTF-8，并优先在 Windows Terminal、PowerShell 7 或 IDE 终端中运行。
 

@@ -67,11 +67,16 @@ def _bundle_root() -> Path:
 
 
 _BASE     = _app_root()
-_DIR_PRIVATE = _BASE / "private"
-_DIR_DATA  = _BASE / "data-player"
-_DIR_SONGS = _DIR_PRIVATE / "songs"
-_DIR_FLRC  = _DIR_PRIVATE / "flrc"
-_DIR_FLPLS = _DIR_PRIVATE / "flpls"
+_DIR_DATA  = _BASE / "player_data"
+_DIR_SONGS = _BASE / "songs"
+_DIR_FLRC  = _BASE / "flrc"
+_DIR_FLPLS = _BASE / "flpls"
+
+
+def _ensure_runtime_dirs() -> None:
+    """Create every writable directory used by the player and its dialogs."""
+    for directory in (_DIR_DATA, _DIR_SONGS, _DIR_FLRC, _DIR_FLPLS):
+        directory.mkdir(parents=True, exist_ok=True)
 
 
 # Use a per-user local socket so starting the executable again activates the
@@ -212,7 +217,7 @@ class Track:
     title:       str = ""
     artist:      str = ""
     album:       str = ""
-    dur_ms:      int = 0      # filled by QMediaPlayer on first play
+    dur_ms:      int = 0      # read from metadata; corrected by QMediaPlayer
     art_data:    bytes = dataclasses.field(default_factory=bytes, repr=False)
     lyrics_path: str = ""     # manually assigned JSON lyrics
     lyrics_offset_ms: int = 500  # lyric timing offset relative to audio (ms)
@@ -224,8 +229,8 @@ class Track:
         return self.artist or "Unknown Artist"
 
 
-def _read_tags(path: str) -> Tuple[str, str, str, bytes]:
-    """Return (title, artist, album, cover_bytes).
+def _read_tags(path: str) -> Tuple[str, str, str, bytes, int]:
+    """Return (title, artist, album, cover_bytes, duration_ms).
 
     Title always follows the current filename (not an embedded ID3 tag), so
     that locally renaming an audio file is reflected immediately when it is
@@ -235,6 +240,7 @@ def _read_tags(path: str) -> Tuple[str, str, str, bytes]:
     """
     artist = album = ""
     art    = b""
+    duration_ms = 0
     stem   = Path(path).stem
     if HAS_MUTAGEN:
         try:
@@ -242,6 +248,9 @@ def _read_tags(path: str) -> Tuple[str, str, str, bytes]:
             if f:
                 artist = str(f.get("artist", [""])[0])
                 album  = str(f.get("album",  [""])[0])
+                length = getattr(getattr(f, "info", None), "length", 0.0)
+                if length and float(length) > 0:
+                    duration_ms = max(1, round(float(length) * 1000.0))
             # album art (ID3)
             f2 = mutagen.File(path)
             if f2:
@@ -251,12 +260,15 @@ def _read_tags(path: str) -> Tuple[str, str, str, bytes]:
                         break
         except Exception:
             pass
-    return stem, artist, album, art
+    return stem, artist, album, art, duration_ms
 
 
 def _build_track(path: str) -> Track:
-    title, artist, album, art = _read_tags(path)
-    return Track(path=path, title=title, artist=artist, album=album, art_data=art)
+    title, artist, album, art, duration_ms = _read_tags(path)
+    return Track(
+        path=path, title=title, artist=artist, album=album,
+        dur_ms=duration_ms, art_data=art,
+    )
 
 
 def _lock_icon(locked: bool) -> QIcon:
@@ -617,9 +629,12 @@ class ArtLabel(QLabel):
         if data:
             px = QPixmap()
             if px.loadFromData(data):
-                self._px = px.scaled(160, 160,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation)
+                # Keep the full-resolution source.  Pre-scaling to 160x160
+                # makes Qt upscale that small bitmap again on a HiDPI screen,
+                # which throws away detail even when the embedded cover is
+                # much larger.  paintEvent maps the original directly to the
+                # device-resolution backing store instead.
+                self._px = px
                 self.update()
                 return
         self._px = None
@@ -628,14 +643,23 @@ class ArtLabel(QLabel):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         r = self.rect()
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(_SURFACE))
         p.drawRoundedRect(r, 8, 8)
         if self._px:
-            x = (r.width()  - self._px.width())  // 2
-            y = (r.height() - self._px.height()) // 2
-            p.drawPixmap(x, y, self._px)
+            source = QRectF(self._px.rect())
+            scale = min(r.width() / source.width(), r.height() / source.height())
+            width = source.width() * scale
+            height = source.height() * scale
+            target = QRectF(
+                (r.width() - width) / 2.0,
+                (r.height() - height) / 2.0,
+                width,
+                height,
+            )
+            p.drawPixmap(target, self._px, source)
         else:
             p.setFont(QFont("Segoe UI Emoji", 48))
             p.setPen(QColor(_SUB))
@@ -1286,7 +1310,15 @@ class LyricOverlay(QWidget):
             self.setWindowOpacity(preview_cfg["opacity"])
             self.canvas.apply_cfg(preview_cfg)
 
-        dlg = _OV.SettingsDialog(self.cfg, self, on_preview=on_preview)
+        def on_center():
+            geometry = _OV._center_window_on_current_screen(self)
+            self.cfg.update(geometry)
+            self.save_geometry()
+            return geometry
+
+        dlg = _OV.SettingsDialog(
+            self.cfg, self, on_preview=on_preview, on_center=on_center
+        )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.cfg = dlg.result_cfg()
             self.setWindowOpacity(self.cfg["opacity"])
@@ -1400,6 +1432,8 @@ class PlayerWindow(QMainWindow):
 
         # ── Window & tray icon ──
         _ico_path = _DIR_DATA / "icon-player.ico"
+        if not _ico_path.exists():
+            _ico_path = _bundle_root() / "player_data" / "icon-player.ico"
         if _ico_path.exists():
             _app_icon = QIcon(str(_ico_path))
             self.setWindowIcon(_app_icon)
@@ -1793,10 +1827,13 @@ class PlayerWindow(QMainWindow):
         self._ctrl.set_position(ms, self._player.duration() if self._player else 0)
 
     def _on_duration(self, ms: int):
-        self._ctrl.set_duration(ms)
-        if 0 <= self._current < len(self._tracks):
-            self._tracks[self._current].dur_ms = ms
-            self._playlist.rebuild(self._tracks, self._current)
+        if ms > 0:
+            self._ctrl.set_duration(ms)
+        if ms > 0 and 0 <= self._current < len(self._tracks):
+            track = self._tracks[self._current]
+            if track.dur_ms != ms:
+                track.dur_ms = ms
+                self._playlist.rebuild(self._tracks, self._current)
         self._apply_pending_restore_position()
 
     def _on_state_change(self, state):
@@ -1913,6 +1950,8 @@ class PlayerWindow(QMainWindow):
         self._now_playing.update_track(track)
         self.setWindowTitle(f"furi-lrc Player — {track.display_title()}")
         self._playlist.highlight(self._current)
+        if track.dur_ms:
+            self._ctrl.set_duration(track.dur_ms)
         self._ctrl.set_offset(track.lyrics_offset_ms)
         if self._overlay:
             if track.lyrics_path and Path(track.lyrics_path).exists():
@@ -2154,6 +2193,8 @@ def main():
         # The already-running player was asked to restore and activate itself.
         # Do not construct a second window or system-tray icon.
         return
+
+    _ensure_runtime_dirs()
 
     # Load bundled Noto Sans JP and apply as app-wide UI font
     _font_path = _bundle_root() / "fonts" / "NotoSansJP-Regular.ttf"

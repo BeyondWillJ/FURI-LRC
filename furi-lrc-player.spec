@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_submodules, collect_all
 
 datas = [
     ('fonts', 'fonts'),
-    ('data-player/icon-player.ico', 'data-player'),
+    ('player_data/icon-player.ico', 'player_data'),
     # Loaded through importlib at runtime; make it available in _MEIPASS.
     ('furi-lrc_rubi.py', '.'),
 ]
@@ -12,7 +12,8 @@ binaries = []
 # imports from the entry point.
 hiddenimports = [
     'PyQt6.QtMultimedia', 'PyQt6.QtMultimediaWidgets',
-    'asyncio', 'ctypes', 'datetime', 're', 'threading', 'time',
+    'asyncio', 'base64', 'ctypes', 'datetime', 'gzip', 'math', 're',
+    'threading', 'time', 'zlib',
 ]
 hiddenimports += collect_submodules('mutagen')
 tmp_ret = collect_all('PyQt6')

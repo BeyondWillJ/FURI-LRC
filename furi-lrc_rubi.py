@@ -15,8 +15,12 @@ Phase 5    All heavy work (shadow parse, font metrics, color construction,
 
 import sys
 import json
+import base64
+import gzip
+import math
 import re
 import time
+import zlib
 import ctypes
 import asyncio
 import threading
@@ -30,6 +34,7 @@ from PyQt6.QtWidgets import (
     QFormLayout, QLineEdit, QDialogButtonBox, QTabWidget,
     QDoubleSpinBox, QColorDialog, QPushButton, QFileDialog,
     QSpinBox, QCheckBox, QSlider, QLabel, QGroupBox, QComboBox,
+    QMessageBox, QPlainTextEdit,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, pyqtSignal, QObject, QPoint, QPointF, QRectF, QRect,
@@ -185,7 +190,100 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), "utf-8")
+
+
+_STYLE_CONFIG_PREFIX = "FURI-LRC1."
+_STYLE_CONFIG_KEYS = (
+    "font_jp", "font_zh", "font_size_jp", "font_size_rt", "font_size_zh",
+    "spacing_rt", "spacing_zh", "color_sung", "color_unsung", "color_zh",
+    "opacity", "hide_on_pause", "unlock_zone", "shadow_enabled",
+    "shadow_color", "shadow_opacity", "shadow_blur", "shadow_dx",
+    "shadow_dy", "align_h", "align_v",
+)
+_STYLE_INT_RANGES = {
+    "font_size_jp": (8, 96), "font_size_rt": (6, 72),
+    "font_size_zh": (8, 96), "spacing_rt": (-30, 60),
+    "spacing_zh": (-60, 60), "unlock_zone": (20, 200),
+}
+_STYLE_FLOAT_RANGES = {
+    "opacity": (0.1, 1.0), "shadow_opacity": (0.0, 1.0),
+    "shadow_blur": (0.0, 40.0), "shadow_dx": (-20.0, 20.0),
+    "shadow_dy": (-20.0, 20.0),
+}
+_STYLE_COLOR_KEYS = {"color_sung", "color_unsung", "color_zh", "shadow_color"}
+
+
+def _encode_style_config(cfg: dict) -> str:
+    """Serialize style controls into a compact, URL-safe configuration code."""
+    style = {key: cfg[key] for key in _STYLE_CONFIG_KEYS}
+    payload = json.dumps(
+        {"version": 1, "style": style},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    compressed = gzip.compress(payload, compresslevel=9, mtime=0)
+    encoded = base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
+    return _STYLE_CONFIG_PREFIX + encoded
+
+
+def _decode_style_config(code: str) -> dict:
+    """Decode and strictly validate a style code without mutating live state."""
+    code = code.strip()
+    if not code.startswith(_STYLE_CONFIG_PREFIX):
+        raise ValueError("設定コードの形式またはバージョンに対応していません。")
+    encoded = code[len(_STYLE_CONFIG_PREFIX):]
+    if not encoded or len(encoded) > 65536 or not re.fullmatch(r"[A-Za-z0-9_-]+", encoded):
+        raise ValueError("設定コードが無効です。")
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        compressed = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        if len(compressed) > 65536:
+            raise ValueError
+        inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        raw = inflater.decompress(compressed, 262145)
+        if len(raw) > 262144 or inflater.unconsumed_tail:
+            raise ValueError
+        raw += inflater.flush(262145 - len(raw))
+        if len(raw) > 262144 or not inflater.eof or inflater.unused_data:
+            raise ValueError
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError, zlib.error, json.JSONDecodeError) as exc:
+        raise ValueError("設定コードが破損しているか、内容が不完全です。") from exc
+
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("設定コードの形式またはバージョンに対応していません。")
+    style = payload.get("style")
+    if not isinstance(style, dict) or set(style) != set(_STYLE_CONFIG_KEYS):
+        raise ValueError("設定コードに必要なスタイル項目がありません。")
+
+    for key in ("font_jp", "font_zh"):
+        if not isinstance(style[key], str) or not style[key] or len(style[key]) > 2048:
+            raise ValueError("設定コードのフォント設定が無効です。")
+    for key, (minimum, maximum) in _STYLE_INT_RANGES.items():
+        value = style[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise ValueError(f"設定コードの {key} が無効です。")
+    for key, (minimum, maximum) in _STYLE_FLOAT_RANGES.items():
+        value = style[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"設定コードの {key} が無効です。")
+        if not math.isfinite(value) or not minimum <= value <= maximum:
+            raise ValueError(f"設定コードの {key} が無効です。")
+    for key in ("hide_on_pause", "shadow_enabled"):
+        if not isinstance(style[key], bool):
+            raise ValueError(f"設定コードの {key} が無効です。")
+    for key in _STYLE_COLOR_KEYS:
+        value = style[key]
+        if not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            raise ValueError("設定コードの色設定が無効です。")
+    if style["align_h"] not in {"left", "center", "right"}:
+        raise ValueError("設定コードの水平位置が無効です。")
+    if style["align_v"] not in {"top", "center", "bottom"}:
+        raise ValueError("設定コードの垂直位置が無効です。")
+    return style
 
 
 # ── SMTC background worker ──
@@ -1084,11 +1182,13 @@ class _SnapSpinBox(QDoubleSpinBox):
 
 # ── Settings dialog ────
 class SettingsDialog(QDialog):
-    def __init__(self, cfg: dict, parent=None, on_preview=None):
+    def __init__(self, cfg: dict, parent=None, on_preview=None, on_center=None):
         super().__init__(parent)
         self.setWindowTitle("furi-lrc 設定")
         self.cfg = dict(cfg)
         self._on_preview = on_preview
+        self._on_center = on_center
+        self._applying_config = False
         if _MENU_FONT:
             self.setFont(_MENU_FONT)
         self._build()
@@ -1114,7 +1214,7 @@ class SettingsDialog(QDialog):
         self.align_v.currentIndexChanged.connect(self._preview)
 
     def _preview(self, *_):
-        if self._on_preview:
+        if self._on_preview and not self._applying_config:
             self._on_preview(self.result_cfg())
 
     def _build(self):
@@ -1272,12 +1372,118 @@ class SettingsDialog(QDialog):
 
         f4.addRow("水平位置", self.align_h)
         f4.addRow("垂直位置", self.align_v)
+        self.btn_center_screen = QPushButton("画面中央に移動")
+        self.btn_center_screen.setEnabled(self._on_center is not None)
+        self.btn_center_screen.clicked.connect(self._center_on_current_screen)
+        f4.addRow("ウィンドウ位置", self.btn_center_screen)
         tabs.addTab(w4, "レイアウト")
+
+        w5 = QWidget()
+        config_layout = QVBoxLayout(w5)
+        config_layout.setSpacing(8)
+        config_note = QLabel("現在の歌詞スタイルを設定コードとして共有できます。")
+        config_note.setWordWrap(True)
+        config_layout.addWidget(config_note)
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(8)
+        btn_export = QPushButton("エクスポート")
+        btn_import = QPushButton("インポート")
+        btn_export.setMinimumHeight(32)
+        btn_import.setMinimumHeight(32)
+        btn_export.clicked.connect(self._export_config_code)
+        btn_import.clicked.connect(self._import_config_code)
+        button_row.addWidget(btn_export, 1)
+        button_row.addWidget(btn_import, 1)
+        config_layout.addLayout(button_row)
+        config_layout.addStretch()
+        tabs.addTab(w5, "設定データ")
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         outer.addWidget(btns)
+
+    def _center_on_current_screen(self):
+        if not self._on_center:
+            return
+        geometry = self._on_center()
+        if isinstance(geometry, dict):
+            self.cfg.update(geometry)
+
+    def _export_config_code(self):
+        code = _encode_style_config(self.result_cfg())
+        QApplication.clipboard().setText(code)
+        QMessageBox.information(
+            self, "設定コードをエクスポート", "設定コードをクリップボードにコピーしました。"
+        )
+
+    def _import_config_code(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("設定コードをインポート")
+        dlg.resize(520, 260)
+        layout = QVBoxLayout(dlg)
+        note = QLabel("設定コードを貼り付けてください。")
+        editor = QPlainTextEdit()
+        editor.setPlaceholderText(_STYLE_CONFIG_PREFIX + "…")
+        editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("インポート")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("キャンセル")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(note)
+        layout.addWidget(editor)
+        layout.addWidget(buttons)
+        editor.setFocus()
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            style = _decode_style_config(editor.toPlainText())
+        except ValueError as exc:
+            QMessageBox.warning(
+                self, "インポートに失敗しました", f"{exc}\n現在のスタイルは変更されていません。"
+            )
+            return
+
+        self._apply_style_config(style)
+        self._preview()
+        QMessageBox.information(self, "インポート完了", "歌詞スタイルを復元しました。")
+
+    def _apply_style_config(self, style: dict):
+        """Populate every style control after the complete code was validated."""
+        self._applying_config = True
+        try:
+            self.font_jp_w._edit.setText(style["font_jp"])
+            self.font_zh_w._edit.setText(style["font_zh"])
+            self.font_size_jp.setValue(style["font_size_jp"])
+            self.font_size_rt.setValue(style["font_size_rt"])
+            self.font_size_zh.setValue(style["font_size_zh"])
+            self.spacing_rt.setValue(style["spacing_rt"])
+            self.spacing_zh.setValue(style["spacing_zh"])
+            for button, key in (
+                (self.btn_sung, "color_sung"),
+                (self.btn_unsung, "color_unsung"),
+                (self.btn_zh, "color_zh"),
+                (self.btn_shadow, "shadow_color"),
+            ):
+                button._color = style[key]
+                button.setStyleSheet(f"background:{button._color};")
+            self.opacity.setValue(style["opacity"])
+            self.hide_pause.setChecked(style["hide_on_pause"])
+            self.unlock_zone.setValue(style["unlock_zone"])
+            self.shadow_enabled.setChecked(style["shadow_enabled"])
+            self.shadow_opacity.setValue(style["shadow_opacity"])
+            self.shadow_blur.setValue(style["shadow_blur"])
+            self.shadow_dx.setValue(style["shadow_dx"])
+            self.shadow_dy.setValue(style["shadow_dy"])
+            self.align_h.setCurrentIndex({"left": 0, "center": 1, "right": 2}[style["align_h"]])
+            self.align_v.setCurrentIndex({"top": 0, "center": 1, "bottom": 2}[style["align_v"]])
+        finally:
+            self._applying_config = False
 
     def _color_btn(self, color: str) -> QPushButton:
         btn = QPushButton()
@@ -1418,6 +1624,28 @@ def _fit_to_screen(x: int, y: int, w: int, h: int) -> Tuple[int, int, int, int]:
     nx = max(avail.x() + KEEP - w, min(x, avail.right()  - KEEP))
     ny = max(avail.y(),             min(y, avail.bottom() - KEEP))
     return nx, ny, w, h
+
+
+def _center_window_on_current_screen(window: QWidget) -> dict:
+    """Show a lyrics window and fit it at the center of the pointer's screen."""
+    screen = (
+        QApplication.screenAt(QCursor.pos())
+        or window.screen()
+        or QApplication.primaryScreen()
+    )
+    if not screen:
+        window.show()
+        return dict(x=window.x(), y=window.y(), w=window.width(), h=window.height())
+
+    avail = screen.availableGeometry()
+    width = min(max(1, window.width()), avail.width())
+    height = min(max(1, window.height()), avail.height())
+    x = avail.x() + (avail.width() - width) // 2
+    y = avail.y() + (avail.height() - height) // 2
+    window.setGeometry(x, y, width, height)
+    window.show()
+    window.raise_()
+    return dict(x=x, y=y, w=width, h=height)
 
 
 def _screen_relative_defaults() -> dict:
@@ -1766,7 +1994,15 @@ class LyricWindow(QWidget):
             self.cfg["unlock_zone"] = self._preview_zone_size
             self._reposition_zone_btn()
 
-        dlg = SettingsDialog(self.cfg, self, on_preview=on_preview)
+        def on_center():
+            geometry = _center_window_on_current_screen(self)
+            self.cfg.update(geometry)
+            save_config(self.cfg)
+            return geometry
+
+        dlg = SettingsDialog(
+            self.cfg, self, on_preview=on_preview, on_center=on_center
+        )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.cfg = dlg.result_cfg()
             self.setWindowOpacity(self.cfg["opacity"])

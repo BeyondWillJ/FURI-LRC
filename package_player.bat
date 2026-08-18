@@ -73,8 +73,8 @@ mkdir "dist\furi-lrc-player\flrc"   2>nul
 mkdir "dist\furi-lrc-player\flpls"  2>nul
 
 echo Verifying bundled desktop-lyrics resources...
-mkdir "dist\furi-lrc-player\data-player" 2>nul
-copy /y "data-player\icon-player.ico" "dist\furi-lrc-player\data-player\" >nul
+mkdir "dist\furi-lrc-player\player_data" 2>nul
+copy /y "player_data\icon-player.ico" "dist\furi-lrc-player\player_data\" >nul
 
 if not exist "dist\furi-lrc-player\_internal\furi-lrc_rubi.py" (
     echo ERROR: The desktop lyrics module was not bundled.
@@ -89,10 +89,6 @@ if not exist "dist\furi-lrc-player\_internal\fonts\NotoSerifJP-SemiBold.ttf" (
     pause
     exit /b 1
 )
-
-echo Copying sample files...
-%PYTHON% -c "import shutil,pathlib; p=pathlib.Path('private/songs/跚をあけて.mp3'); shutil.copy2(p, pathlib.Path('dist/furi-lrc-player/songs')/p.name) if p.exists() else None"
-if exist "private\flrc\tobira-wo-akete.flrc"    copy /y "private\flrc\tobira-wo-akete.flrc"    "dist\furi-lrc-player\flrc\" >nul
 
 echo.
 echo ============================================================
